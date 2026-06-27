@@ -1,5 +1,5 @@
 #include <stdbool.h>
-#include <stdio.h>
+#include <stdint.h>
 
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -34,34 +34,44 @@
 #define STEP_PERIOD_US 1000
 #endif
 
-#ifndef STEP_COUNT
-#define STEP_COUNT 200
+// Time-based movement test.
+#ifndef MOVE_TIME_MS
+#define MOVE_TIME_MS 5000
 #endif
 
-#ifndef STEP_DWELL_MS
-#define STEP_DWELL_MS 1000
+#ifndef PAUSE_MS
+#define PAUSE_MS 1000
 #endif
 
 static const char *TAG = "step_motor";
 
 static void motor_enable(bool enable)
 {
-    gpio_set_level(EN_GPIO, (enable && EN_ACTIVE_LOW) ? 0 : 1);
-    if (!EN_ACTIVE_LOW) {
+    if (EN_ACTIVE_LOW) {
+        gpio_set_level(EN_GPIO, enable ? 0 : 1);
+    } else {
         gpio_set_level(EN_GPIO, enable ? 1 : 0);
     }
 }
 
-static void motor_step(bool dir, int steps)
+static void motor_step_once(void)
+{
+    gpio_set_level(STEP_GPIO, 1);
+    esp_rom_delay_us(STEP_PULSE_US);
+    gpio_set_level(STEP_GPIO, 0);
+    esp_rom_delay_us(STEP_PERIOD_US);
+}
+
+static void motor_run_for_ms(bool dir, uint32_t duration_ms)
 {
     gpio_set_level(DIR_GPIO, dir ? 1 : 0);
     vTaskDelay(pdMS_TO_TICKS(2));
 
-    for (int i = 0; i < steps; ++i) {
-        gpio_set_level(STEP_GPIO, 1);
-        esp_rom_delay_us(STEP_PULSE_US);
-        gpio_set_level(STEP_GPIO, 0);
-        esp_rom_delay_us(STEP_PERIOD_US);
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t duration = pdMS_TO_TICKS(duration_ms);
+
+    while ((xTaskGetTickCount() - start) < duration) {
+        motor_step_once();
     }
 }
 
@@ -88,18 +98,18 @@ void app_main(void)
 
     ESP_LOGI(TAG, "STEP=%d DIR=%d EN=%d", STEP_GPIO, DIR_GPIO, EN_GPIO);
     ESP_LOGI(TAG, "Enable pin is %s", EN_ACTIVE_LOW ? "active-low" : "active-high");
-    ESP_LOGI(TAG, "Pulse=%dus period=%dus steps=%d", STEP_PULSE_US, STEP_PERIOD_US, STEP_COUNT);
+    ESP_LOGI(TAG, "Pulse=%dus period=%dus move=%ums pause=%ums", STEP_PULSE_US, STEP_PERIOD_US, MOVE_TIME_MS, PAUSE_MS);
 
     motor_enable(true);
-    ESP_LOGI(TAG, "Driver enabled. Starting test loop.");
+    ESP_LOGI(TAG, "Driver enabled. Starting time-based direction test.");
 
     while (true) {
-        ESP_LOGI(TAG, "Forward %d steps", STEP_COUNT);
-        motor_step(true, STEP_COUNT);
-        vTaskDelay(pdMS_TO_TICKS(STEP_DWELL_MS));
+        ESP_LOGI(TAG, "Forward for %u ms", MOVE_TIME_MS);
+        motor_run_for_ms(true, MOVE_TIME_MS);
+        vTaskDelay(pdMS_TO_TICKS(PAUSE_MS));
 
-        ESP_LOGI(TAG, "Reverse %d steps", STEP_COUNT);
-        motor_step(false, STEP_COUNT);
-        vTaskDelay(pdMS_TO_TICKS(STEP_DWELL_MS));
+        ESP_LOGI(TAG, "Reverse for %u ms", MOVE_TIME_MS);
+        motor_run_for_ms(false, MOVE_TIME_MS);
+        vTaskDelay(pdMS_TO_TICKS(PAUSE_MS));
     }
 }

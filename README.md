@@ -6,7 +6,7 @@ Ele faz só o básico:
 - habilita o driver
 - define direção
 - gera pulsos no STEP
-- alterna entre frente e ré em loop
+- anda por um tempo fixo para frente e depois o mesmo tempo para trás
 
 ## Ligações
 
