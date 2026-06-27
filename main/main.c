@@ -69,9 +69,17 @@ static void motor_run_for_ms(bool dir, uint32_t duration_ms)
 
     const TickType_t start = xTaskGetTickCount();
     const TickType_t duration = pdMS_TO_TICKS(duration_ms);
+    uint32_t step_counter = 0;
 
     while ((xTaskGetTickCount() - start) < duration) {
         motor_step_once();
+        step_counter++;
+
+        // Give the scheduler and idle task time to run so the task watchdog
+        // does not fire during long stepping runs.
+        if ((step_counter % 100U) == 0U) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
     }
 }
 
