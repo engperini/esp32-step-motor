@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <inttypes.h>
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -146,7 +147,7 @@ static void motor_setup(void)
 
     ESP_LOGI(TAG, "STEP=%d DIR=%d EN=%d", STEP_GPIO, DIR_GPIO, EN_GPIO);
     ESP_LOGI(TAG, "Enable pin is %s", EN_ACTIVE_LOW ? "active-low" : "active-high");
-    ESP_LOGI(TAG, "PWM step frequency=%u Hz (%u us period), resolution=%u bits", freq_hz, STEP_PERIOD_US, resolution_bits);
+    ESP_LOGI(TAG, "PWM step frequency=%" PRIu32 " Hz (%" PRIu32 " us period), resolution=%" PRIu32 " bits", freq_hz, (uint32_t)STEP_PERIOD_US, resolution_bits);
     ESP_LOGI(TAG, "Move=%u ms pause=%u ms", MOVE_TIME_MS, PAUSE_MS);
 }
 
