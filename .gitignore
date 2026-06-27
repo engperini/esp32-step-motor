@@ -1,0 +1,16 @@
+# Build artifacts
+build/
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+*.log
+
+# Python cache
+__pycache__/
+.pytest_cache/
+
+# Editor files
+.vscode/
+.idea/
+.DS_Store
