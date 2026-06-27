@@ -1,0 +1,23 @@
+menu "Step Motor Wi-Fi Settings"
+
+    config STEP_MOTOR_DEVICE_NAME
+        string "mDNS hostname"
+        default "esp32-step-motor"
+
+    config STEP_MOTOR_WIFI_SSID
+        string "Wi-Fi SSID (for Home Assistant / LAN access)"
+        default ""
+
+    config STEP_MOTOR_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+
+    config STEP_MOTOR_AP_SSID
+        string "Fallback AP SSID"
+        default "esp32-step-motor"
+
+    config STEP_MOTOR_AP_PASSWORD
+        string "Fallback AP password"
+        default "stepmotor123"
+
+endmenu

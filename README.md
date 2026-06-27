@@ -1,46 +1,133 @@
 # esp32-step-motor
 
-Projeto ESP-IDF para testar um driver TMC2208 com um XIAO ESP32-S3 Sense.
+Firmware ESP-IDF para um TMC2208 com XIAO ESP32-S3 Sense, agora com:
 
-## O que ele faz
+- controle do motor via *hardware PWM* no STEP
+- servidor HTTP embutido
+- API JSON para integração com Home Assistant
+- página web local para controle manual e configuração
+- modo automático alternando frente / ré
+- modo por *tempo* ou por *quantidade de passos*
 
-- habilita o driver
-- define direção via `DIR`
-- gera pulsos de STEP com *hardware PWM* no ESP32
-- anda por um tempo fixo para frente e depois o mesmo tempo para trás
-- pausa entre as trocas de direção
+## Pinos padrão
 
-## Por que este firmware é melhor
+Edite em `main/main.c` se quiser mudar a pinagem:
 
-A geração de pulsos não é feita em loop apertado de software.
+- `STEP_GPIO = GPIO_NUM_4`
+- `DIR_GPIO = GPIO_NUM_5`
+- `EN_GPIO = GPIO_NUM_6`
 
-O `STEP` sai por periférico de hardware, então:
+O enable do TMC2208 é *ativo em nível baixo* por padrão.
 
-- não trava a CPU
-- não dispara watchdog por busy-wait
-- mantém frequência estável
-- é mais apropriado para teste real de motor de passo
+## Wi-Fi
 
-## Ligações
+A placa sobe um *fallback AP* sempre:
 
-Edite os pinos em `main/main.c`:
+- SSID padrão: `esp32-step-motor`
+- senha padrão: `stepmotor123`
 
-- `STEP_GPIO`
-- `DIR_GPIO`
-- `EN_GPIO`
+Para conectar o ESP32 à sua rede e usar Home Assistant na LAN, abra `idf.py menuconfig` e preencha:
 
-> O enable do TMC2208 é normalmente *ativo em nível baixo*.
+- *Step Motor Wi-Fi Settings → Wi-Fi SSID*
+- *Step Motor Wi-Fi Settings → Wi-Fi password*
 
-## Parâmetros principais
+Se a STA conectar, use o IP mostrado na tela ou nos logs do boot.
 
-No `main/main.c` você pode mudar:
+O AP fallback sempre sobe em:
 
-- `STEP_PERIOD_US` — período entre pulsos de STEP
-- `MOVE_TIME_MS` — tempo andando em cada direção
-- `PAUSE_MS` — pausa entre frente e ré
-- `DIR_SETUP_US` — tempo de setup da direção antes de iniciar os pulsos
+- `http://192.168.4.1/`
 
-## Build no Ubuntu / ESP-IDF
+## Página web
+
+Abra no navegador:
+
+- `http://192.168.4.1/` quando estiver no AP fallback
+- ou o IP da sua rede local mostrado na tela / logs quando a STA conectar
+
+Na página você consegue:
+
+- escolher `time` ou `steps`
+- ajustar `step_period_us`
+- ajustar `move_time_ms`
+- ajustar `move_steps`
+- ajustar `pause_ms`
+- ajustar `dir_setup_us`
+- mandar `Jog forward`
+- mandar `Jog reverse`
+- `Stop`
+- `Start auto`
+- `Stop auto`
+
+## API HTTP
+
+Endpoints disponíveis:
+
+- `GET /api/health`
+- `GET /api/state`
+- `POST /api/config`
+- `POST /api/control`
+
+### `GET /api/state`
+
+Retorna JSON com o estado atual, por exemplo:
+
+```json
+{
+  "profile": "time",
+  "auto_mode": false,
+  "running": false,
+  "activity": "idle",
+  "pending_action": "none"
+}
+```
+
+### `POST /api/config`
+
+Exemplo de body:
+
+```json
+{
+  "profile": "steps",
+  "step_period_us": 1000,
+  "move_time_ms": 5000,
+  "move_steps": 200,
+  "pause_ms": 1000,
+  "dir_setup_us": 20
+}
+```
+
+### `POST /api/control`
+
+Exemplos de `action`:
+
+- `forward`
+- `reverse`
+- `stop`
+- `auto_start`
+- `auto_stop`
+
+## Home Assistant
+
+Você pode integrar com `rest_command`, `rest` sensor, botões ou scripts HTTP.
+
+Exemplo simples de `rest_command`:
+
+```yaml
+rest_command:
+  step_motor_forward:
+    url: http://192.168.4.1/api/control
+    method: POST
+    content_type: application/json
+    payload: '{"action":"forward"}'
+
+  step_motor_auto_start:
+    url: http://192.168.4.1/api/control
+    method: POST
+    content_type: application/json
+    payload: '{"action":"auto_start"}'
+```
+
+## Build
 
 ```bash
 cd /home/pi/esp32-step-motor
@@ -51,14 +138,10 @@ idf.py build
 
 ## Flash
 
-Exemplo:
-
 ```bash
 idf.py -p /tmp/ttyesp32 flash monitor
 ```
 
-Se a sua porta for outra, troque pelo device correto.
-
 ## Observação
 
-Este projeto continua simples de propósito, mas agora a parte crítica do STEP usa hardware PWM.
+Este projeto foi feito para ser simples de integrar e estável para teste real. A geração do STEP fica no periférico de hardware, então o firmware não depende mais de loops pesados de software para manter o watchdog feliz.
