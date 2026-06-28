@@ -118,6 +118,9 @@ typedef struct {
     bool wifi_ap_started;
     char wifi_sta_ip[16];
     char wifi_ap_ip[16];
+    char wifi_mode[8];
+    char wifi_ssid[33];
+    bool wifi_emergency_ap;
     char hostname[32];
 } app_state_t;
 
@@ -130,7 +133,23 @@ static esp_event_handler_instance_t g_wifi_handler_instance;
 static esp_event_handler_instance_t g_ip_handler_instance;
 static uint32_t g_current_step_period_us;
 static uint32_t g_pwm_resolution_bits;
+
+typedef enum {
+    WIFI_PREF_AP = 0,
+    WIFI_PREF_STA = 1,
+} wifi_pref_t;
+
+typedef struct {
+    wifi_pref_t preferred_mode;
+    char sta_ssid[33];
+    char sta_password[65];
+} wifi_settings_t;
+
+static wifi_settings_t g_wifi_settings;
+static bool g_wifi_started;
 static app_state_t g_state;
+
+static void update_ap_ip_from_netif(void);
 
 static const char INDEX_HTML[] =
 "<!doctype html>\n"
@@ -155,6 +174,10 @@ static const char INDEX_HTML[] =
 "    .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; background: #334155; margin-right: 6px; margin-bottom: 6px; }\n"
 "    .muted { color: #94a3b8; }\n"
 "    pre { white-space: pre-wrap; word-break: break-word; margin: 0; }\n"
+"    code { background: #0b1220; padding: 2px 6px; border-radius: 6px; }\n"
+"    details { margin-top: 10px; }\n"
+"    summary { cursor: pointer; font-weight: 600; }\n"
+"    ol { margin-top: 0.5rem; }\n"
 "  </style>\n"
 "</head>\n"
 "<body>\n"
@@ -163,12 +186,6 @@ static const char INDEX_HTML[] =
 "    <div class='muted'>HTTP API + local control page</div>\n"
 "  </header>\n"
 "  <main>\n"
-"    <section class='card'>\n"
-"      <h2>Status</h2>\n"
-"      <div id='status'>Loading...</div>\n"
-"      <pre id='json' class='muted'></pre>\n"
-"    </section>\n"
-"\n"
 "    <section class='card'>\n"
 "      <h2>Motion config</h2>\n"
 "      <div class='grid'>\n"
@@ -195,7 +212,7 @@ static const char INDEX_HTML[] =
 "        </label>\n"
 "      </div>\n"
 "      <div class='row' style='margin-top:12px'>\n"
-"        <button class='primary' onclick='saveConfig()'>Apply settings</button>\n"
+"        <button class='primary' onclick='saveMotionConfig()'>Apply settings</button>\n"
 "        <button onclick='refreshState()'>Refresh</button>\n"
 "      </div>\n"
 "    </section>\n"
@@ -212,13 +229,88 @@ static const char INDEX_HTML[] =
 "    </section>\n"
 "\n"
 "    <section class='card'>\n"
-"      <h2>API</h2>\n"
-"      <div>\n"
-"        <span class='pill'>GET /api/health</span>\n"
-"        <span class='pill'>GET /api/state</span>\n"
-"        <span class='pill'>POST /api/config</span>\n"
-"        <span class='pill'>POST /api/control</span>\n"
+"      <h2>Wi-Fi setup</h2>\n"
+"      <p class='muted'>O AP de emergência permanece disponível em <code>192.168.4.1</code> para recuperação e configuração, mesmo quando o modo principal for a rede do roteador.</p>\n"
+"      <div class='grid'>\n"
+"        <label>Modo principal\n"
+"          <select id='wifi_mode'>\n"
+"            <option value='ap'>AP local / emergência</option>\n"
+"            <option value='sta'>Wi-Fi do roteador</option>\n"
+"          </select>\n"
+"        </label>\n"
+"        <label>SSID do roteador\n"
+"          <input id='wifi_ssid' type='text' maxlength='32' placeholder='Minha rede Wi-Fi'>\n"
+"        </label>\n"
+"        <label>Senha do roteador\n"
+"          <input id='wifi_password' type='password' maxlength='64' placeholder='Opcional'>\n"
+"        </label>\n"
 "      </div>\n"
+"      <div class='row' style='margin-top:12px'>\n"
+"        <button class='primary' onclick='saveWifiConfig()'>Salvar Wi-Fi</button>\n"
+"        <button onclick='refreshState()'>Atualizar</button>\n"
+"      </div>\n"
+"    </section>\n"
+"\n"
+"    <section class='card'>\n"
+"      <h2>Como usar</h2>\n"
+"      <ol>\n"
+"        <li>Abra a página no <code>http://192.168.4.1/</code> ou no IP da sua LAN quando o modo cliente estiver ativo.</li>\n"
+"        <li>Escolha o modo principal: <strong>AP local</strong> ou <strong>Wi-Fi do roteador</strong>.</li>\n"
+"        <li>Se for usar a rede do roteador, informe SSID e senha e clique em <strong>Salvar Wi-Fi</strong>.</li>\n"
+"        <li>Use os botões manuais para testar o motor ou deixe o modo automático ligado.</li>\n"
+"        <li>Para integrações, use os endpoints listados abaixo.</li>\n"
+"      </ol>\n"
+"      <details>\n"
+"        <summary>Integração com Home Assistant</summary>\n"
+"        <p>Exemplo simples com <code>rest_command</code>:</p>\n"
+"        <pre>rest_command:\n"
+"  step_motor_forward:\n"
+"    url: http://192.168.4.1/api/control\n"
+"    method: POST\n"
+"    content_type: application/json\n"
+"    payload: '{\"action\":\"forward\"}'\n"
+"\n"
+"  step_motor_reverse:\n"
+"    url: http://192.168.4.1/api/control\n"
+"    method: POST\n"
+"    content_type: application/json\n"
+"    payload: '{\"action\":\"reverse\"}'\n"
+"\n"
+"  step_motor_stop:\n"
+"    url: http://192.168.4.1/api/control\n"
+"    method: POST\n"
+"    content_type: application/json\n"
+"    payload: '{\"action\":\"stop\"}'\n"
+"\n"
+"  step_motor_auto_start:\n"
+"    url: http://192.168.4.1/api/control\n"
+"    method: POST\n"
+"    content_type: application/json\n"
+"    payload: '{\"action\":\"auto_start\"}'\n"
+"\n"
+"  step_motor_auto_stop:\n"
+"    url: http://192.168.4.1/api/control\n"
+"    method: POST\n"
+"    content_type: application/json\n"
+"    payload: '{\"action\":\"auto_stop\"}'</pre>\n"
+"      </details>\n"
+"      <details>\n"
+"        <summary>Endpoints disponíveis</summary>\n"
+"        <ul>\n"
+"          <li><code>GET /api/health</code></li>\n"
+"          <li><code>GET /api/state</code></li>\n"
+"          <li><code>POST /api/config</code></li>\n"
+"          <li><code>POST /api/control</code></li>\n"
+"          <li><code>GET /api/wifi</code></li>\n"
+"          <li><code>POST /api/wifi</code></li>\n"
+"        </ul>\n"
+"      </details>\n"
+"    </section>\n"
+"\n"
+"    <section class='card'>\n"
+"      <h2>Status</h2>\n"
+"      <div id='status'>Loading...</div>\n"
+"      <pre id='json' class='muted'></pre>\n"
 "    </section>\n"
 "  </main>\n"
 "  <script>\n"
@@ -238,22 +330,27 @@ static const char INDEX_HTML[] =
 "      document.getElementById('move_steps').value = state.move_steps;\n"
 "      document.getElementById('pause_ms').value = state.pause_ms;\n"
 "      document.getElementById('dir_setup_us').value = state.dir_setup_us;\n"
+"      document.getElementById('wifi_mode').value = state.wifi_mode;\n"
+"      document.getElementById('wifi_ssid').value = state.wifi_ssid;\n"
 "\n"
-"      const wifi = state.wifi_sta_connected ? ('STA ' + state.wifi_sta_ip) : 'STA disconnected';\n"
+"      const wifi = state.wifi_sta_connected ? ('STA ' + state.wifi_sta_ip) : 'STA desconectado';\n"
 "      const ap = state.wifi_ap_started ? ('AP ' + state.wifi_ap_ip) : 'AP off';\n"
 "      document.getElementById('status').innerHTML = `\n"
 "        <span class='pill'>${state.running ? 'RUNNING' : 'IDLE'}</span>\n"
 "        <span class='pill'>${state.auto_mode ? 'AUTO' : 'MANUAL'}</span>\n"
 "        <span class='pill'>profile ${state.profile}</span>\n"
+"        <span class='pill'>mode ${state.wifi_mode}</span>\n"
 "        <span class='pill'>${wifi}</span>\n"
 "        <span class='pill'>${ap}</span>\n"
+"        <span class='pill'>SSID ${state.wifi_ssid || '—'}</span>\n"
 "        <span class='pill'>freq ${state.step_frequency_hz} Hz</span>\n"
 "        <span class='pill'>move ${state.move_duration_ms} ms</span>\n"
+"        <span class='pill'>emergency AP ${state.wifi_emergency_ap ? 'on' : 'off'}</span>\n"
 "        <span class='pill'>pending ${state.pending_action}</span>\n"
 "      `;\n"
 "    }\n"
 "\n"
-"    async function saveConfig() {\n"
+"    async function saveMotionConfig() {\n"
 "      await api('/api/config', {\n"
 "        profile: document.getElementById('profile').value,\n"
 "        step_period_us: parseInt(document.getElementById('step_period_us').value, 10),\n"
@@ -262,6 +359,16 @@ static const char INDEX_HTML[] =
 "        pause_ms: parseInt(document.getElementById('pause_ms').value, 10),\n"
 "        dir_setup_us: parseInt(document.getElementById('dir_setup_us').value, 10)\n"
 "      });\n"
+"      await refreshState();\n"
+"    }\n"
+"\n"
+"    async function saveWifiConfig() {\n"
+"      await api('/api/wifi', {\n"
+"        mode: document.getElementById('wifi_mode').value,\n"
+"        ssid: document.getElementById('wifi_ssid').value,\n"
+"        password: document.getElementById('wifi_password').value\n"
+"      });\n"
+"      document.getElementById('wifi_password').value = '';\n"
 "      await refreshState();\n"
 "    }\n"
 "\n"
@@ -274,7 +381,8 @@ static const char INDEX_HTML[] =
 "    setInterval(() => refreshState().catch(console.error), 1000);\n"
 "  </script>\n"
 "</body>\n"
-"</html>\n";
+"</html>\n"
+;
 
 static const char *motion_profile_to_string(motion_profile_t profile)
 {
@@ -316,6 +424,173 @@ static const char *bool_to_json(bool value)
     return value ? "true" : "false";
 }
 
+static const char *wifi_pref_to_string(wifi_pref_t pref)
+{
+    return (pref == WIFI_PREF_STA) ? "sta" : "ap";
+}
+
+static wifi_pref_t wifi_pref_from_string(const char *value)
+{
+    if (value == NULL) {
+        return WIFI_PREF_AP;
+    }
+
+    if (strcmp(value, "sta") == 0 || strcmp(value, "client") == 0 || strcmp(value, "wifi") == 0) {
+        return WIFI_PREF_STA;
+    }
+
+    return WIFI_PREF_AP;
+}
+
+static void wifi_settings_sync_state_locked(void)
+{
+    snprintf(g_state.wifi_mode, sizeof(g_state.wifi_mode), "%s", wifi_pref_to_string(g_wifi_settings.preferred_mode));
+    snprintf(g_state.wifi_ssid, sizeof(g_state.wifi_ssid), "%s", g_wifi_settings.sta_ssid);
+    g_state.wifi_emergency_ap = true;
+}
+
+static void wifi_settings_set_defaults(void)
+{
+    memset(&g_wifi_settings, 0, sizeof(g_wifi_settings));
+
+    if (strlen(CONFIG_STEP_MOTOR_WIFI_SSID) > 0U) {
+        g_wifi_settings.preferred_mode = WIFI_PREF_STA;
+        snprintf(g_wifi_settings.sta_ssid, sizeof(g_wifi_settings.sta_ssid), "%s", CONFIG_STEP_MOTOR_WIFI_SSID);
+        snprintf(g_wifi_settings.sta_password, sizeof(g_wifi_settings.sta_password), "%s", CONFIG_STEP_MOTOR_WIFI_PASSWORD);
+    } else {
+        g_wifi_settings.preferred_mode = WIFI_PREF_AP;
+    }
+}
+
+static void copy_string_field(char *dst, size_t dst_len, const char *src)
+{
+    if (dst_len == 0) {
+        return;
+    }
+
+    size_t n = strnlen(src, dst_len - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+static void wifi_settings_apply_to_state(void)
+{
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    wifi_settings_sync_state_locked();
+    xSemaphoreGive(g_state_mutex);
+}
+
+static void wifi_settings_load_from_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("wifi_cfg", NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        wifi_settings_apply_to_state();
+        return;
+    }
+
+    uint8_t mode = (uint8_t)g_wifi_settings.preferred_mode;
+    size_t len = sizeof(g_wifi_settings.sta_ssid);
+    if (nvs_get_u8(handle, "mode", &mode) == ESP_OK) {
+        g_wifi_settings.preferred_mode = (wifi_pref_t)mode;
+    }
+
+    len = sizeof(g_wifi_settings.sta_ssid);
+    if (nvs_get_str(handle, "ssid", g_wifi_settings.sta_ssid, &len) != ESP_OK) {
+        g_wifi_settings.sta_ssid[0] = '\0';
+    }
+
+    len = sizeof(g_wifi_settings.sta_password);
+    if (nvs_get_str(handle, "password", g_wifi_settings.sta_password, &len) != ESP_OK) {
+        g_wifi_settings.sta_password[0] = '\0';
+    }
+
+    nvs_close(handle);
+    wifi_settings_apply_to_state();
+}
+
+static esp_err_t wifi_settings_save_to_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("wifi_cfg", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_u8(handle, "mode", (uint8_t)g_wifi_settings.preferred_mode);
+    if (err == ESP_OK) {
+        err = nvs_set_str(handle, "ssid", g_wifi_settings.sta_ssid);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(handle, "password", g_wifi_settings.sta_password);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+    return err;
+}
+
+static bool wifi_should_use_sta(void)
+{
+    return g_wifi_settings.preferred_mode == WIFI_PREF_STA && g_wifi_settings.sta_ssid[0] != '\0';
+}
+
+static void wifi_build_ap_config(wifi_config_t *ap_config)
+{
+    memset(ap_config, 0, sizeof(*ap_config));
+    copy_string_field((char *)ap_config->ap.ssid, sizeof(ap_config->ap.ssid), CONFIG_STEP_MOTOR_AP_SSID);
+    copy_string_field((char *)ap_config->ap.password, sizeof(ap_config->ap.password), CONFIG_STEP_MOTOR_AP_PASSWORD);
+    ap_config->ap.ssid_len = strlen(CONFIG_STEP_MOTOR_AP_SSID);
+    ap_config->ap.channel = 1;
+    ap_config->ap.authmode = (strlen(CONFIG_STEP_MOTOR_AP_PASSWORD) >= 8U) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    ap_config->ap.max_connection = 4;
+    ap_config->ap.beacon_interval = 100;
+}
+
+static void wifi_build_sta_config(wifi_config_t *sta_config)
+{
+    memset(sta_config, 0, sizeof(*sta_config));
+    copy_string_field((char *)sta_config->sta.ssid, sizeof(sta_config->sta.ssid), g_wifi_settings.sta_ssid);
+    copy_string_field((char *)sta_config->sta.password, sizeof(sta_config->sta.password), g_wifi_settings.sta_password);
+    sta_config->sta.threshold.authmode = (strlen(g_wifi_settings.sta_password) >= 8U) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    sta_config->sta.pmf_cfg.capable = true;
+    sta_config->sta.pmf_cfg.required = false;
+}
+
+static void wifi_apply_settings(bool stop_first)
+{
+    wifi_config_t ap_config;
+    wifi_build_ap_config(&ap_config);
+
+    if (stop_first && g_wifi_started) {
+        ESP_ERROR_CHECK(esp_wifi_stop());
+        g_wifi_started = false;
+    }
+
+    const bool use_sta = wifi_should_use_sta();
+    ESP_ERROR_CHECK(esp_wifi_set_mode(use_sta ? WIFI_MODE_APSTA : WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+
+    if (use_sta) {
+        wifi_config_t sta_config;
+        wifi_build_sta_config(&sta_config);
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_start());
+    g_wifi_started = true;
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    if (use_sta) {
+        ESP_ERROR_CHECK(esp_wifi_connect());
+    }
+
+    update_ap_ip_from_netif();
+    wifi_settings_apply_to_state();
+}
+
 static void state_init_defaults(void)
 {
     memset(&g_state, 0, sizeof(g_state));
@@ -329,7 +604,15 @@ static void state_init_defaults(void)
     g_state.running = false;
     g_state.activity = MOTOR_ACTIVITY_IDLE;
     g_state.pending_action = MOTOR_ACTION_NONE;
+    g_state.wifi_sta_connected = false;
+    g_state.wifi_ap_started = false;
+    g_state.wifi_sta_ip[0] = '\0';
+    g_state.wifi_ap_ip[0] = '\0';
+    g_state.wifi_mode[0] = '\0';
+    g_state.wifi_ssid[0] = '\0';
+    g_state.wifi_emergency_ap = true;
     snprintf(g_state.hostname, sizeof(g_state.hostname), "%s", HOSTNAME);
+    wifi_settings_apply_to_state();
 }
 
 static app_state_t state_snapshot(void)
@@ -738,6 +1021,9 @@ static void build_state_json(char *buf, size_t len)
              "\"wifi_sta_ip\":\"%s\","
              "\"wifi_ap_started\":%s,"
              "\"wifi_ap_ip\":\"%s\","
+             "\"wifi_mode\":\"%s\","
+             "\"wifi_ssid\":\"%s\","
+             "\"wifi_emergency_ap\":%s,"
              "\"hostname\":\"%s\""
              "}",
              motion_profile_to_string(s.profile),
@@ -756,6 +1042,33 @@ static void build_state_json(char *buf, size_t len)
              s.wifi_sta_ip,
              bool_to_json(s.wifi_ap_started),
              s.wifi_ap_ip,
+             s.wifi_mode,
+             s.wifi_ssid,
+             bool_to_json(s.wifi_emergency_ap),
+             s.hostname);
+}
+
+static void build_wifi_json(char *buf, size_t len)
+{
+    const app_state_t s = state_snapshot();
+    snprintf(buf, len,
+             "{"
+             "\"mode\":\"%s\","
+             "\"ssid\":\"%s\","
+             "\"sta_connected\":%s,"
+             "\"sta_ip\":\"%s\","
+             "\"ap_started\":%s,"
+             "\"ap_ip\":\"%s\","
+             "\"emergency_ap\":%s,"
+             "\"hostname\":\"%s\""
+             "}",
+             s.wifi_mode,
+             s.wifi_ssid,
+             bool_to_json(s.wifi_sta_connected),
+             s.wifi_sta_ip,
+             bool_to_json(s.wifi_ap_started),
+             s.wifi_ap_ip,
+             bool_to_json(s.wifi_emergency_ap),
              s.hostname);
 }
 
@@ -788,7 +1101,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 
     app_state_t snapshot = state_snapshot();
     uint32_t value;
-    char str[32];
+    char str[64];
 
     if (json_get_string_field(body, "profile", str, sizeof(str))) {
         snapshot.profile = (strcmp(str, "steps") == 0) ? MOTION_PROFILE_STEPS : MOTION_PROFILE_TIME;
@@ -879,6 +1192,61 @@ static esp_err_t control_post_handler(httpd_req_t *req)
     return send_json(req, json);
 }
 
+static esp_err_t wifi_get_handler(httpd_req_t *req)
+{
+    char json[1024];
+    build_wifi_json(json, sizeof(json));
+    return send_json(req, json);
+}
+
+static esp_err_t wifi_post_handler(httpd_req_t *req)
+{
+    char *body = read_request_body(req);
+    if (body == NULL) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid request body");
+    }
+
+    wifi_settings_t settings;
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    settings = g_wifi_settings;
+    xSemaphoreGive(g_state_mutex);
+
+    char str[64];
+    if (json_get_string_field(body, "mode", str, sizeof(str))) {
+        settings.preferred_mode = wifi_pref_from_string(str);
+    }
+
+    if (json_get_string_field(body, "ssid", str, sizeof(str)) && str[0] != '\0') {
+        copy_string_field(settings.sta_ssid, sizeof(settings.sta_ssid), str);
+    }
+
+    if (json_get_string_field(body, "password", str, sizeof(str)) && str[0] != '\0') {
+        copy_string_field(settings.sta_password, sizeof(settings.sta_password), str);
+    }
+
+    if (settings.preferred_mode == WIFI_PREF_STA && settings.sta_ssid[0] == '\0') {
+        free(body);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ssid required for station mode");
+    }
+
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    g_wifi_settings = settings;
+    wifi_settings_sync_state_locked();
+    xSemaphoreGive(g_state_mutex);
+
+    esp_err_t save_err = wifi_settings_save_to_nvs();
+    if (save_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to save Wi-Fi settings to NVS: %s", esp_err_to_name(save_err));
+    }
+
+    wifi_apply_settings(true);
+    free(body);
+
+    char json[1024];
+    build_wifi_json(json, sizeof(json));
+    return send_json(req, json);
+}
+
 static esp_err_t options_handler(httpd_req_t *req)
 {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -902,7 +1270,7 @@ static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 8192;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 20;
     config.lru_purge_enable = true;
 
     ESP_ERROR_CHECK(httpd_start(&g_http_server, &config));
@@ -916,7 +1284,11 @@ static void start_http_server(void)
     register_uri(g_http_server, "/api/config", HTTP_OPTIONS, options_handler);
     register_uri(g_http_server, "/api/control", HTTP_POST, control_post_handler);
     register_uri(g_http_server, "/api/control", HTTP_OPTIONS, options_handler);
+    register_uri(g_http_server, "/api/wifi", HTTP_GET, wifi_get_handler);
+    register_uri(g_http_server, "/api/wifi", HTTP_OPTIONS, options_handler);
+    register_uri(g_http_server, "/api/wifi", HTTP_POST, wifi_post_handler);
 }
+
 
 static void update_sta_ip(const char *ip)
 {
@@ -943,7 +1315,7 @@ static void update_ap_ip_from_netif(void)
     esp_netif_ip_info_t ip_info;
     if (esp_netif_get_ip_info(g_ap_netif, &ip_info) == ESP_OK) {
         char ip[16];
-        ip4addr_ntoa_r(&ip_info.ip, ip, sizeof(ip));
+        ip4addr_ntoa_r((const ip4_addr_t *)&ip_info.ip, ip, sizeof(ip));
         xSemaphoreTake(g_state_mutex, portMAX_DELAY);
         g_state.wifi_ap_started = true;
         snprintf(g_state.wifi_ap_ip, sizeof(g_state.wifi_ap_ip), "%s", ip);
@@ -956,12 +1328,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     (void)arg;
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        if (strlen(CONFIG_STEP_MOTOR_WIFI_SSID) > 0U) {
+        if (wifi_should_use_sta()) {
             esp_wifi_connect();
         }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         update_sta_disconnected();
-        if (strlen(CONFIG_STEP_MOTOR_WIFI_SSID) > 0U) {
+        if (wifi_should_use_sta()) {
             ESP_LOGW(TAG, "Wi-Fi disconnected, reconnecting...");
             esp_wifi_connect();
         }
@@ -970,7 +1342,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
         char ip[16];
-        ip4addr_ntoa_r(&event->ip_info.ip, ip, sizeof(ip));
+        ip4addr_ntoa_r((const ip4_addr_t *)&event->ip_info.ip, ip, sizeof(ip));
         update_sta_ip(ip);
         ESP_LOGI(TAG, "Wi-Fi connected: %s", ip);
     }
@@ -989,37 +1361,12 @@ static void wifi_start(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &g_wifi_handler_instance));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &g_ip_handler_instance));
 
-    wifi_config_t ap_config = { 0 };
-    snprintf((char *)ap_config.ap.ssid, sizeof(ap_config.ap.ssid), "%s", CONFIG_STEP_MOTOR_AP_SSID);
-    snprintf((char *)ap_config.ap.password, sizeof(ap_config.ap.password), "%s", CONFIG_STEP_MOTOR_AP_PASSWORD);
-    ap_config.ap.ssid_len = strlen(CONFIG_STEP_MOTOR_AP_SSID);
-    ap_config.ap.channel = 1;
-    ap_config.ap.authmode = (strlen(CONFIG_STEP_MOTOR_AP_PASSWORD) >= 8U) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    ap_config.ap.max_connection = 4;
-    ap_config.ap.beacon_interval = 100;
+    wifi_settings_set_defaults();
+    wifi_settings_load_from_nvs();
+    wifi_apply_settings(false);
 
-    const bool sta_enabled = strlen(CONFIG_STEP_MOTOR_WIFI_SSID) > 0U;
-    if (sta_enabled) {
-        wifi_config_t sta_config = { 0 };
-        snprintf((char *)sta_config.sta.ssid, sizeof(sta_config.sta.ssid), "%s", CONFIG_STEP_MOTOR_WIFI_SSID);
-        snprintf((char *)sta_config.sta.password, sizeof(sta_config.sta.password), "%s", CONFIG_STEP_MOTOR_WIFI_PASSWORD);
-        sta_config.sta.threshold.authmode = (strlen(CONFIG_STEP_MOTOR_WIFI_PASSWORD) >= 8U) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-        sta_config.sta.pmf_cfg.capable = true;
-        sta_config.sta.pmf_cfg.required = false;
-
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
-    } else {
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    }
-
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    update_ap_ip_from_netif();
-
-    if (!sta_enabled) {
-        ESP_LOGW(TAG, "No STA SSID configured. Using fallback AP only.");
+    if (!wifi_should_use_sta()) {
+        ESP_LOGW(TAG, "No Wi-Fi station SSID configured. Running AP emergency mode only.");
     }
 }
 
@@ -1080,5 +1427,5 @@ void app_main(void)
     motor_enable(true);
 
     ESP_LOGI(TAG, "HTTP server ready: http://%s/", HOSTNAME);
-    ESP_LOGI(TAG, "API endpoints: GET /api/health, GET /api/state, POST /api/config, POST /api/control");
+    ESP_LOGI(TAG, "API endpoints: GET /api/health, GET /api/state, POST /api/config, POST /api/control, GET /api/wifi, POST /api/wifi");
 }

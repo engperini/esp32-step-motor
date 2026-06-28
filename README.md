@@ -21,28 +21,25 @@ O enable do TMC2208 é *ativo em nível baixo* por padrão.
 
 ## Wi-Fi
 
-A placa sobe um *fallback AP* sempre:
+O firmware agora trabalha com **AP de emergência + configuração em tempo de execução**.
 
-- SSID padrão: `esp32-step-motor`
-- senha padrão: `stepmotor123`
+### Modos disponíveis na página
 
-Para conectar o ESP32 à sua rede e usar Home Assistant na LAN, abra `idf.py menuconfig` e preencha:
+- **AP local / emergência**
+  - mantém o acesso em `http://192.168.4.1/`
+  - ideal para setup, manutenção e uso sem roteador
+- **Wi-Fi do roteador**
+  - o ESP32 tenta entrar na sua rede doméstica/industrial
+  - o AP de emergência continua disponível para recuperação
 
-- *Step Motor Wi-Fi Settings → Wi-Fi SSID*
-- *Step Motor Wi-Fi Settings → Wi-Fi password*
-
-Se a STA conectar, use o IP mostrado na tela ou nos logs do boot.
-
-O AP fallback sempre sobe em:
-
-- `http://192.168.4.1/`
+As credenciais e o modo ficam salvos em NVS e podem ser alterados a qualquer momento pela interface web.
 
 ## Página web
 
 Abra no navegador:
 
-- `http://192.168.4.1/` quando estiver no AP fallback
-- ou o IP da sua rede local mostrado na tela / logs quando a STA conectar
+- `http://192.168.4.1/` quando estiver no AP de emergência
+- ou o IP da sua rede local quando o modo cliente estiver ativo
 
 Na página você consegue:
 
@@ -52,6 +49,8 @@ Na página você consegue:
 - ajustar `move_steps`
 - ajustar `pause_ms`
 - ajustar `dir_setup_us`
+- configurar o modo Wi-Fi
+- salvar SSID e senha do roteador
 - mandar `Jog forward`
 - mandar `Jog reverse`
 - `Stop`
@@ -66,10 +65,12 @@ Endpoints disponíveis:
 - `GET /api/state`
 - `POST /api/config`
 - `POST /api/control`
+- `GET /api/wifi`
+- `POST /api/wifi`
 
 ### `GET /api/state`
 
-Retorna JSON com o estado atual, por exemplo:
+Retorna JSON com o estado do motor e do Wi-Fi. Exemplo resumido:
 
 ```json
 {
@@ -77,7 +78,11 @@ Retorna JSON com o estado atual, por exemplo:
   "auto_mode": false,
   "running": false,
   "activity": "idle",
-  "pending_action": "none"
+  "pending_action": "none",
+  "wifi_mode": "ap",
+  "wifi_ssid": "MinhaRede",
+  "wifi_sta_connected": false,
+  "wifi_ap_ip": "192.168.4.1"
 }
 ```
 
@@ -95,6 +100,38 @@ Exemplo de body:
   "dir_setup_us": 20
 }
 ```
+
+### `GET /api/wifi`
+
+Retorna o estado/configuração de Wi-Fi:
+
+```json
+{
+  "mode": "sta",
+  "ssid": "MinhaRede",
+  "sta_connected": true,
+  "sta_ip": "192.168.1.50",
+  "ap_started": true,
+  "ap_ip": "192.168.4.1",
+  "emergency_ap": true
+}
+```
+
+### `POST /api/wifi`
+
+Exemplo de body:
+
+```json
+{
+  "mode": "sta",
+  "ssid": "MinhaRede",
+  "password": "minha_senha"
+}
+```
+
+- `mode`: `ap` ou `sta`
+- `ssid` e `password` são opcionais ao mudar apenas o modo
+- o AP de emergência permanece ativo para recuperação
 
 ### `POST /api/control`
 
@@ -120,12 +157,36 @@ rest_command:
     content_type: application/json
     payload: '{"action":"forward"}'
 
+  step_motor_reverse:
+    url: http://192.168.4.1/api/control
+    method: POST
+    content_type: application/json
+    payload: '{"action":"reverse"}'
+
+  step_motor_stop:
+    url: http://192.168.4.1/api/control
+    method: POST
+    content_type: application/json
+    payload: '{"action":"stop"}'
+
   step_motor_auto_start:
     url: http://192.168.4.1/api/control
     method: POST
     content_type: application/json
     payload: '{"action":"auto_start"}'
+
+  step_motor_auto_stop:
+    url: http://192.168.4.1/api/control
+    method: POST
+    content_type: application/json
+    payload: '{"action":"auto_stop"}'
 ```
+
+Se o ESP32 estiver conectado ao roteador, substitua `192.168.4.1` pelo IP da LAN.
+
+## Observação
+
+A geração do STEP fica no periférico de hardware, então o firmware não depende de loops pesados de software para manter o watchdog feliz.
 
 ## Build
 
