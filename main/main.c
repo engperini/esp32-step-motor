@@ -24,16 +24,36 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#ifndef STEP_GPIO
-#define STEP_GPIO GPIO_NUM_4
+#ifndef MOTOR_STEPS_PER_REV
+#define MOTOR_STEPS_PER_REV 200U
 #endif
 
-#ifndef DIR_GPIO
-#define DIR_GPIO GPIO_NUM_5
+#ifndef MOTOR_MAX_RPM
+#define MOTOR_MAX_RPM 300U
 #endif
 
-#ifndef EN_GPIO
-#define EN_GPIO GPIO_NUM_6
+#ifndef MOTOR1_STEP_GPIO
+#define MOTOR1_STEP_GPIO GPIO_NUM_4
+#endif
+
+#ifndef MOTOR1_DIR_GPIO
+#define MOTOR1_DIR_GPIO GPIO_NUM_5
+#endif
+
+#ifndef MOTOR1_EN_GPIO
+#define MOTOR1_EN_GPIO GPIO_NUM_6
+#endif
+
+#ifndef MOTOR2_STEP_GPIO
+#define MOTOR2_STEP_GPIO GPIO_NUM_7
+#endif
+
+#ifndef MOTOR2_DIR_GPIO
+#define MOTOR2_DIR_GPIO GPIO_NUM_8
+#endif
+
+#ifndef MOTOR2_EN_GPIO
+#define MOTOR2_EN_GPIO GPIO_NUM_9
 #endif
 
 #ifndef EN_ACTIVE_LOW
@@ -83,9 +103,6 @@
 static const char *TAG = "step_motor";
 static const char *HOSTNAME = CONFIG_STEP_MOTOR_DEVICE_NAME;
 
-static const ledc_mode_t LEDC_SPEED_MODE = LEDC_LOW_SPEED_MODE;
-static const ledc_timer_t LEDC_TIMER_NUM = LEDC_TIMER_0;
-static const ledc_channel_t LEDC_CHANNEL_NUM = LEDC_CHANNEL_0;
 
 typedef enum {
     MOTION_PROFILE_TIME = 0,
@@ -109,6 +126,7 @@ typedef enum {
 typedef struct {
     motion_profile_t profile;
     uint32_t step_period_us;
+    uint32_t rpm;
     uint32_t move_time_ms;
     uint32_t move_steps;
     uint32_t pause_ms;
@@ -117,6 +135,25 @@ typedef struct {
     bool running;
     motor_activity_t activity;
     motor_action_t pending_action;
+    uint32_t current_step_period_us;
+    uint32_t pwm_resolution_bits;
+} motor_state_t;
+
+typedef struct {
+    gpio_num_t step_gpio;
+    gpio_num_t dir_gpio;
+    gpio_num_t en_gpio;
+    ledc_channel_t channel;
+    ledc_timer_t timer;
+    TaskHandle_t task_handle;
+} motor_hw_t;
+
+typedef struct {
+    motor_hw_t hw;
+    motor_state_t state;
+} motor_ctx_t;
+
+typedef struct {
     bool wifi_sta_connected;
     bool wifi_ap_started;
     char wifi_sta_ip[16];
@@ -128,14 +165,15 @@ typedef struct {
 } app_state_t;
 
 static SemaphoreHandle_t g_state_mutex;
-static TaskHandle_t g_motor_task_handle;
 static httpd_handle_t g_http_server;
 static esp_netif_t *g_sta_netif;
 static esp_netif_t *g_ap_netif;
 static esp_event_handler_instance_t g_wifi_handler_instance;
 static esp_event_handler_instance_t g_ip_handler_instance;
-static uint32_t g_current_step_period_us;
-static uint32_t g_pwm_resolution_bits;
+static motor_ctx_t g_motors[2];
+static uint32_t step_frequency_hz_from_period(uint32_t step_period_us);
+static uint32_t rpm_from_step_period_us(uint32_t step_period_us);
+static uint32_t step_period_us_from_rpm(uint32_t rpm);
 
 typedef enum {
     WIFI_PREF_AP = 0,
@@ -191,44 +229,78 @@ static const char INDEX_HTML[] =
 "  </header>\n"
 "  <main>\n"
 "    <section class='card'>\n"
-"      <h2>Motion config</h2>\n"
+"      <h2>Motor 1</h2>\n"
 "      <div class='grid'>\n"
 "        <label>Profile\n"
-"          <select id='profile'>\n"
+"          <select id='m1_profile'>\n"
 "            <option value='time'>time</option>\n"
 "            <option value='steps'>steps</option>\n"
 "          </select>\n"
 "        </label>\n"
-"        <label>Step period (us)\n"
-"          <input id='step_period_us' type='number' min='50' step='1' value='1000'>\n"
+"        <label>RPM\n"
+"          <input id='m1_rpm' type='number' min='1' max='300' step='1' value='300'>\n"
 "        </label>\n"
 "        <label>Move time (ms)\n"
-"          <input id='move_time_ms' type='number' min='0' step='1' value='5000'>\n"
+"          <input id='m1_move_time_ms' type='number' min='0' step='1' value='5000'>\n"
 "        </label>\n"
 "        <label>Steps per move\n"
-"          <input id='move_steps' type='number' min='0' step='1' value='200'>\n"
+"          <input id='m1_move_steps' type='number' min='0' step='1' value='200'>\n"
 "        </label>\n"
 "        <label>Pause (ms)\n"
-"          <input id='pause_ms' type='number' min='0' step='1' value='1000'>\n"
+"          <input id='m1_pause_ms' type='number' min='0' step='1' value='1000'>\n"
 "        </label>\n"
 "        <label>Dir setup (us)\n"
-"          <input id='dir_setup_us' type='number' min='0' step='1' value='20'>\n"
+"          <input id='m1_dir_setup_us' type='number' min='0' step='1' value='20'>\n"
 "        </label>\n"
 "      </div>\n"
 "      <div class='row' style='margin-top:12px'>\n"
-"        <button class='primary' onclick='saveMotionConfig()'>Apply settings</button>\n"
+"        <button class='primary' onclick='saveMotionConfig(1)'>Apply motor 1</button>\n"
 "        <button onclick='refreshState()'>Refresh</button>\n"
+"      </div>\n"
+"      <div class='row' style='margin-top:12px'>\n"
+"        <button class='good' onclick='sendAction(1, \"forward\")'>Jog forward</button>\n"
+"        <button class='good' onclick='sendAction(1, \"reverse\")'>Jog reverse</button>\n"
+"        <button class='warn' onclick='sendAction(1, \"stop\")'>Stop</button>\n"
+"        <button class='primary' onclick='sendAction(1, \"auto_start\")'>Start auto</button>\n"
+"        <button class='warn' onclick='sendAction(1, \"auto_stop\")'>Stop auto</button>\n"
 "      </div>\n"
 "    </section>\n"
 "\n"
 "    <section class='card'>\n"
-"      <h2>Manual control</h2>\n"
-"      <div class='row'>\n"
-"        <button class='good' onclick='sendAction(\"forward\")'>Jog forward</button>\n"
-"        <button class='good' onclick='sendAction(\"reverse\")'>Jog reverse</button>\n"
-"        <button class='warn' onclick='sendAction(\"stop\")'>Stop</button>\n"
-"        <button class='primary' onclick='sendAction(\"auto_start\")'>Start auto</button>\n"
-"        <button class='warn' onclick='sendAction(\"auto_stop\")'>Stop auto</button>\n"
+"      <h2>Motor 2</h2>\n"
+"      <div class='grid'>\n"
+"        <label>Profile\n"
+"          <select id='m2_profile'>\n"
+"            <option value='time'>time</option>\n"
+"            <option value='steps'>steps</option>\n"
+"          </select>\n"
+"        </label>\n"
+"        <label>RPM\n"
+"          <input id='m2_rpm' type='number' min='1' max='300' step='1' value='300'>\n"
+"        </label>\n"
+"        <label>Move time (ms)\n"
+"          <input id='m2_move_time_ms' type='number' min='0' step='1' value='5000'>\n"
+"        </label>\n"
+"        <label>Steps per move\n"
+"          <input id='m2_move_steps' type='number' min='0' step='1' value='200'>\n"
+"        </label>\n"
+"        <label>Pause (ms)\n"
+"          <input id='m2_pause_ms' type='number' min='0' step='1' value='1000'>\n"
+"        </label>\n"
+"        <label>Dir setup (us)\n"
+"          <input id='m2_dir_setup_us' type='number' min='0' step='1' value='20'>\n"
+"        </label>\n"
+"      </div>\n"
+"      <div class='row' style='margin-top:12px'>\n"
+"        <button class='primary' onclick='saveMotionConfig(2)'>Apply motor 2</button>\n"
+"        <button onclick='refreshState()'>Refresh</button>\n"
+"      </div>\n"
+"      <div class='row' style='margin-top:12px'>\n"
+"        <button class='good' onclick='sendAction(2, \"forward\")'>Jog forward</button>\n"
+"        <button class='good' onclick='sendAction(2, \"reverse\")'>Jog reverse</button>\n"
+"        <button class='warn' onclick='sendAction(2, \"stop\")'>Stop</button>\n"
+"        <button class='primary' onclick='sendAction(2, \"auto_start\")'>Start auto</button>\n"
+"        <button class='warn' onclick='sendAction(2, \"auto_stop\")'>Stop auto</button>\n"
 "      </div>\n"
 "    </section>\n"
 "\n"
@@ -367,32 +439,42 @@ static const char INDEX_HTML[] =
 "      }\n"
 "    }\n"
 "\n"
+"    function motorPrefix(motor) {\n"
+"      return motor === 2 ? 'm2' : 'm1';\n"
+"    }\n"
+"\n"
+"    function applyMotorState(motor, state) {\n"
+"      const prefix = motorPrefix(motor);\n"
+"      syncField(prefix + '_profile', state.profile);\n"
+"      syncField(prefix + '_rpm', state.rpm);\n"
+"      syncField(prefix + '_move_time_ms', state.move_time_ms);\n"
+"      syncField(prefix + '_move_steps', state.move_steps);\n"
+"      syncField(prefix + '_pause_ms', state.pause_ms);\n"
+"      syncField(prefix + '_dir_setup_us', state.dir_setup_us);\n"
+"    }\n"
+"\n"
 "    async function refreshState() {\n"
 "      const state = await api('/api/state');\n"
 "      document.getElementById('json').textContent = JSON.stringify(state, null, 2);\n"
-"      syncField('profile', state.profile);\n"
-"      syncField('step_period_us', state.step_period_us);\n"
-"      syncField('move_time_ms', state.move_time_ms);\n"
-"      syncField('move_steps', state.move_steps);\n"
-"      syncField('pause_ms', state.pause_ms);\n"
-"      syncField('dir_setup_us', state.dir_setup_us);\n"
+"      applyMotorState(1, state.motor1);\n"
+"      applyMotorState(2, state.motor2);\n"
 "      syncField('wifi_mode', state.wifi_mode);\n"
 "      syncField('wifi_ssid', state.wifi_ssid);\n"
 "\n"
 "      const wifi = state.wifi_sta_connected ? ('STA ' + state.wifi_sta_ip) : 'STA desconectado';\n"
 "      const ap = state.wifi_ap_started ? ('AP ' + state.wifi_ap_ip) : 'AP off';\n"
 "      document.getElementById('status').innerHTML = `\n"
-"        <span class='pill'>${state.running ? 'RUNNING' : 'IDLE'}</span>\n"
-"        <span class='pill'>${state.auto_mode ? 'AUTO' : 'MANUAL'}</span>\n"
-"        <span class='pill'>profile ${state.profile}</span>\n"
+"        <span class='pill'>M1 ${state.motor1.running ? 'RUNNING' : 'IDLE'}</span>\n"
+"        <span class='pill'>M1 rpm ${state.motor1.rpm}</span>\n"
+"        <span class='pill'>M1 ${state.motor1.activity}</span>\n"
+"        <span class='pill'>M2 ${state.motor2.running ? 'RUNNING' : 'IDLE'}</span>\n"
+"        <span class='pill'>M2 rpm ${state.motor2.rpm}</span>\n"
+"        <span class='pill'>M2 ${state.motor2.activity}</span>\n"
 "        <span class='pill'>mode ${state.wifi_mode}</span>\n"
 "        <span class='pill'>${wifi}</span>\n"
 "        <span class='pill'>${ap}</span>\n"
 "        <span class='pill'>SSID ${state.wifi_ssid || '—'}</span>\n"
-"        <span class='pill'>freq ${state.step_frequency_hz} Hz</span>\n"
-"        <span class='pill'>move ${state.move_duration_ms} ms</span>\n"
 "        <span class='pill'>emergency AP ${state.wifi_emergency_ap ? 'on' : 'off'}</span>\n"
-"        <span class='pill'>pending ${state.pending_action}</span>\n"
 "      `;\n"
 "      refreshOtaStatus().catch(console.error);\n"
 "    }\n"
@@ -512,14 +594,16 @@ static const char INDEX_HTML[] =
 "      });\n"
 "    }\n"
 "\n"
-"    async function saveMotionConfig() {\n"
+"    async function saveMotionConfig(motor) {\n"
+"      const prefix = motorPrefix(motor);\n"
 "      await api('/api/config', {\n"
-"        profile: document.getElementById('profile').value,\n"
-"        step_period_us: parseInt(document.getElementById('step_period_us').value, 10),\n"
-"        move_time_ms: parseInt(document.getElementById('move_time_ms').value, 10),\n"
-"        move_steps: parseInt(document.getElementById('move_steps').value, 10),\n"
-"        pause_ms: parseInt(document.getElementById('pause_ms').value, 10),\n"
-"        dir_setup_us: parseInt(document.getElementById('dir_setup_us').value, 10)\n"
+"        motor,\n"
+"        profile: document.getElementById(prefix + '_profile').value,\n"
+"        rpm: parseInt(document.getElementById(prefix + '_rpm').value, 10),\n"
+"        move_time_ms: parseInt(document.getElementById(prefix + '_move_time_ms').value, 10),\n"
+"        move_steps: parseInt(document.getElementById(prefix + '_move_steps').value, 10),\n"
+"        pause_ms: parseInt(document.getElementById(prefix + '_pause_ms').value, 10),\n"
+"        dir_setup_us: parseInt(document.getElementById(prefix + '_dir_setup_us').value, 10)\n"
 "      });\n"
 "      clearDirtyFields();\n"
 "      await refreshState();\n"
@@ -536,8 +620,8 @@ static const char INDEX_HTML[] =
 "      await refreshState();\n"
 "    }\n"
 "\n"
-"    async function sendAction(action) {\n"
-"      await api('/api/control', { action });\n"
+"    async function sendAction(motor, action) {\n"
+"      await api('/api/control', { motor, action });\n"
 "      await refreshState();\n"
 "    }\n"
 "\n"
@@ -911,16 +995,6 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
 static void state_init_defaults(void)
 {
     memset(&g_state, 0, sizeof(g_state));
-    g_state.profile = MOTION_PROFILE_TIME;
-    g_state.step_period_us = STEP_PERIOD_US;
-    g_state.move_time_ms = MOVE_TIME_MS;
-    g_state.move_steps = STEP_COUNT;
-    g_state.pause_ms = PAUSE_MS;
-    g_state.dir_setup_us = DIR_SETUP_US;
-    g_state.auto_mode = false;
-    g_state.running = false;
-    g_state.activity = MOTOR_ACTIVITY_IDLE;
-    g_state.pending_action = MOTOR_ACTION_NONE;
     g_state.wifi_sta_connected = false;
     g_state.wifi_ap_started = false;
     g_state.wifi_sta_ip[0] = '\0';
@@ -930,6 +1004,22 @@ static void state_init_defaults(void)
     g_state.wifi_emergency_ap = true;
     snprintf(g_state.hostname, sizeof(g_state.hostname), "%s", HOSTNAME);
     wifi_settings_apply_to_state();
+
+    for (size_t i = 0; i < 2; ++i) {
+        g_motors[i].state.profile = MOTION_PROFILE_TIME;
+        g_motors[i].state.step_period_us = STEP_PERIOD_US;
+        g_motors[i].state.rpm = rpm_from_step_period_us(STEP_PERIOD_US);
+        g_motors[i].state.move_time_ms = MOVE_TIME_MS;
+        g_motors[i].state.move_steps = STEP_COUNT;
+        g_motors[i].state.pause_ms = PAUSE_MS;
+        g_motors[i].state.dir_setup_us = DIR_SETUP_US;
+        g_motors[i].state.auto_mode = false;
+        g_motors[i].state.running = false;
+        g_motors[i].state.activity = MOTOR_ACTIVITY_IDLE;
+        g_motors[i].state.pending_action = MOTOR_ACTION_NONE;
+        g_motors[i].state.current_step_period_us = 0U;
+        g_motors[i].state.pwm_resolution_bits = 0U;
+    }
 }
 
 static app_state_t state_snapshot(void)
@@ -941,10 +1031,24 @@ static app_state_t state_snapshot(void)
     return snapshot;
 }
 
-static void notify_motor_task(void)
+static motor_state_t motor_snapshot(size_t motor_index)
 {
-    if (g_motor_task_handle != NULL) {
-        xTaskNotifyGive(g_motor_task_handle);
+    motor_state_t snapshot;
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    snapshot = g_motors[motor_index].state;
+    xSemaphoreGive(g_state_mutex);
+    return snapshot;
+}
+
+static size_t motor_index_from_request(uint32_t motor)
+{
+    return (motor == 2U) ? 1U : 0U;
+}
+
+static void notify_motor_task(size_t motor_index)
+{
+    if (motor_index < 2U && g_motors[motor_index].hw.task_handle != NULL) {
+        xTaskNotifyGive(g_motors[motor_index].hw.task_handle);
     }
 }
 
@@ -965,6 +1069,28 @@ static uint32_t step_frequency_hz_from_period(uint32_t step_period_us)
     return 1000000U / step_period_us;
 }
 
+static uint32_t rpm_from_step_period_us(uint32_t step_period_us)
+{
+    step_period_us = clamp_u32(step_period_us, 50U, 1000000U);
+    const uint64_t numerator = 60000000ULL;
+    const uint64_t denominator = (uint64_t)step_period_us * (uint64_t)MOTOR_STEPS_PER_REV;
+    if (denominator == 0ULL) {
+        return 0U;
+    }
+    return (uint32_t)(numerator / denominator);
+}
+
+static uint32_t step_period_us_from_rpm(uint32_t rpm)
+{
+    rpm = clamp_u32(rpm, 1U, MOTOR_MAX_RPM);
+    const uint64_t numerator = 60000000ULL;
+    const uint64_t denominator = (uint64_t)rpm * (uint64_t)MOTOR_STEPS_PER_REV;
+    if (denominator == 0ULL) {
+        return STEP_PERIOD_US;
+    }
+    return (uint32_t)(numerator / denominator);
+}
+
 static uint32_t ledc_resolution_bits_for_frequency(uint32_t freq_hz)
 {
     if (freq_hz <= 1000U) {
@@ -976,25 +1102,24 @@ static uint32_t ledc_resolution_bits_for_frequency(uint32_t freq_hz)
     return LEDC_TIMER_8_BIT;
 }
 
-static void motor_enable(bool enable)
+static void motor_enable(size_t motor_index, bool enable)
 {
-    if (EN_ACTIVE_LOW) {
-        gpio_set_level(EN_GPIO, enable ? 0 : 1);
-    } else {
-        gpio_set_level(EN_GPIO, enable ? 1 : 0);
-    }
+    const int level = EN_ACTIVE_LOW ? (enable ? 0 : 1) : (enable ? 1 : 0);
+    gpio_set_level(g_motors[motor_index].hw.en_gpio, level);
 }
 
-static void motor_stop_output(void)
+static void motor_stop_output(size_t motor_index)
 {
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_SPEED_MODE, LEDC_CHANNEL_NUM, 0));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_SPEED_MODE, LEDC_CHANNEL_NUM));
+    motor_ctx_t *ctx = &g_motors[motor_index];
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, ctx->hw.channel, 0));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, ctx->hw.channel));
 }
 
-static void motor_apply_pwm_period(uint32_t step_period_us)
+static void motor_apply_pwm_period(size_t motor_index, uint32_t step_period_us)
 {
+    motor_ctx_t *ctx = &g_motors[motor_index];
     step_period_us = clamp_u32(step_period_us, 50U, 1000000U);
-    if (step_period_us == g_current_step_period_us && g_pwm_resolution_bits != 0U) {
+    if (step_period_us == ctx->state.current_step_period_us && ctx->state.pwm_resolution_bits != 0U) {
         return;
     }
 
@@ -1002,46 +1127,47 @@ static void motor_apply_pwm_period(uint32_t step_period_us)
     const uint32_t resolution_bits = ledc_resolution_bits_for_frequency(freq_hz);
 
     ledc_timer_config_t timer = {
-        .speed_mode = LEDC_SPEED_MODE,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
         .duty_resolution = (ledc_timer_bit_t)resolution_bits,
-        .timer_num = LEDC_TIMER_NUM,
+        .timer_num = ctx->hw.timer,
         .freq_hz = freq_hz,
         .clk_cfg = LEDC_AUTO_CLK,
     };
     ESP_ERROR_CHECK(ledc_timer_config(&timer));
 
-    g_current_step_period_us = step_period_us;
-    g_pwm_resolution_bits = resolution_bits;
+    ctx->state.current_step_period_us = step_period_us;
+    ctx->state.pwm_resolution_bits = resolution_bits;
 }
 
-static void motor_step_output_start(void)
+static void motor_step_output_start(size_t motor_index)
 {
-    const uint32_t max_duty = (1U << g_pwm_resolution_bits) - 1U;
+    motor_ctx_t *ctx = &g_motors[motor_index];
+    const uint32_t max_duty = (1U << ctx->state.pwm_resolution_bits) - 1U;
     const uint32_t duty = max_duty / 2U;
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_SPEED_MODE, LEDC_CHANNEL_NUM, duty));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_SPEED_MODE, LEDC_CHANNEL_NUM));
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, ctx->hw.channel, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, ctx->hw.channel));
 }
 
-static motor_action_t take_pending_action(void)
+static motor_action_t take_pending_action(size_t motor_index)
 {
     motor_action_t action;
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-    action = g_state.pending_action;
-    g_state.pending_action = MOTOR_ACTION_NONE;
+    action = g_motors[motor_index].state.pending_action;
+    g_motors[motor_index].state.pending_action = MOTOR_ACTION_NONE;
     xSemaphoreGive(g_state_mutex);
     return action;
 }
 
-static motor_action_t peek_pending_action(void)
+static motor_action_t peek_pending_action(size_t motor_index)
 {
     motor_action_t action;
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-    action = g_state.pending_action;
+    action = g_motors[motor_index].state.pending_action;
     xSemaphoreGive(g_state_mutex);
     return action;
 }
 
-static uint64_t motion_duration_us_from_state(const app_state_t *state)
+static uint64_t motion_duration_us_from_state(const motor_state_t *state)
 {
     if (state->profile == MOTION_PROFILE_STEPS) {
         return (uint64_t)state->move_steps * (uint64_t)state->step_period_us;
@@ -1049,13 +1175,13 @@ static uint64_t motion_duration_us_from_state(const app_state_t *state)
     return (uint64_t)state->move_time_ms * 1000ULL;
 }
 
-static bool wait_abortable_us(uint64_t duration_us)
+static bool wait_abortable_us(size_t motor_index, uint64_t duration_us)
 {
     const uint64_t slice_us = 20000ULL;
     const int64_t end_time = esp_timer_get_time() + (int64_t)duration_us;
 
     while (true) {
-        if (peek_pending_action() != MOTOR_ACTION_NONE) {
+        if (peek_pending_action(motor_index) != MOTOR_ACTION_NONE) {
             return false;
         }
 
@@ -1073,41 +1199,41 @@ static bool wait_abortable_us(uint64_t duration_us)
     }
 }
 
-static bool motor_run_segment(bool forward, uint64_t duration_us, uint32_t dir_setup_us)
+static bool motor_run_segment(size_t motor_index, bool forward, uint64_t duration_us, uint32_t dir_setup_us)
 {
     if (duration_us == 0U) {
         return true;
     }
 
-    gpio_set_level(DIR_GPIO, forward ? 1 : 0);
+    gpio_set_level(g_motors[motor_index].hw.dir_gpio, forward ? 1 : 0);
     esp_rom_delay_us(dir_setup_us);
 
-    motor_step_output_start();
-    const bool completed = wait_abortable_us(duration_us);
-    motor_stop_output();
+    motor_step_output_start(motor_index);
+    const bool completed = wait_abortable_us(motor_index, duration_us);
+    motor_stop_output(motor_index);
     return completed;
 }
 
-static bool motion_wait_pause(uint32_t pause_ms)
+static bool motion_wait_pause(size_t motor_index, uint32_t pause_ms)
 {
-    return wait_abortable_us((uint64_t)pause_ms * 1000ULL);
+    return wait_abortable_us(motor_index, (uint64_t)pause_ms * 1000ULL);
 }
 
-static void set_activity_idle(app_state_t *state)
+static void set_activity_idle(motor_state_t *state)
 {
     state->activity = MOTOR_ACTIVITY_IDLE;
     state->running = false;
     state->auto_mode = false;
 }
 
-static void set_activity_running(app_state_t *state)
+static void set_activity_running(motor_state_t *state)
 {
     state->activity = MOTOR_ACTIVITY_RUNNING;
     state->running = true;
     state->auto_mode = false;
 }
 
-static void set_activity_auto(app_state_t *state)
+static void set_activity_auto(motor_state_t *state)
 {
     state->activity = MOTOR_ACTIVITY_AUTO;
     state->running = true;
@@ -1116,14 +1242,14 @@ static void set_activity_auto(app_state_t *state)
 
 static void motor_task(void *arg)
 {
-    (void)arg;
+    const size_t motor_index = (size_t)(uintptr_t)arg;
 
     while (true) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
 
-        motor_action_t action = take_pending_action();
+        motor_action_t action = take_pending_action(motor_index);
         if (action == MOTOR_ACTION_NONE) {
-            const app_state_t snapshot = state_snapshot();
+            const motor_state_t snapshot = motor_snapshot(motor_index);
             if (snapshot.auto_mode) {
                 action = MOTOR_ACTION_START_AUTO;
             } else {
@@ -1132,71 +1258,71 @@ static void motor_task(void *arg)
         }
 
         if (action == MOTOR_ACTION_STOP) {
-            motor_stop_output();
+            motor_stop_output(motor_index);
             xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-            set_activity_idle(&g_state);
+            set_activity_idle(&g_motors[motor_index].state);
             xSemaphoreGive(g_state_mutex);
             continue;
         }
 
         if (action == MOTOR_ACTION_JOG_FORWARD || action == MOTOR_ACTION_JOG_REVERSE) {
-            const app_state_t snapshot = state_snapshot();
-            motor_apply_pwm_period(snapshot.step_period_us);
+            const motor_state_t snapshot = motor_snapshot(motor_index);
+            motor_apply_pwm_period(motor_index, snapshot.step_period_us);
 
             xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-            set_activity_running(&g_state);
+            set_activity_running(&g_motors[motor_index].state);
             xSemaphoreGive(g_state_mutex);
 
             const uint64_t duration_us = motion_duration_us_from_state(&snapshot);
-            (void)motor_run_segment(action == MOTOR_ACTION_JOG_FORWARD, duration_us, snapshot.dir_setup_us);
+            (void)motor_run_segment(motor_index, action == MOTOR_ACTION_JOG_FORWARD, duration_us, snapshot.dir_setup_us);
 
-            motor_stop_output();
+            motor_stop_output(motor_index);
             xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-            set_activity_idle(&g_state);
+            set_activity_idle(&g_motors[motor_index].state);
             xSemaphoreGive(g_state_mutex);
             continue;
         }
 
         if (action == MOTOR_ACTION_START_AUTO) {
             while (true) {
-                app_state_t snapshot = state_snapshot();
+                motor_state_t snapshot = motor_snapshot(motor_index);
                 if (!snapshot.auto_mode) {
                     break;
                 }
 
-                motor_apply_pwm_period(snapshot.step_period_us);
+                motor_apply_pwm_period(motor_index, snapshot.step_period_us);
 
                 xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-                set_activity_auto(&g_state);
+                set_activity_auto(&g_motors[motor_index].state);
                 xSemaphoreGive(g_state_mutex);
 
                 const uint64_t duration_us = motion_duration_us_from_state(&snapshot);
-                if (!motor_run_segment(true, duration_us, snapshot.dir_setup_us)) {
+                if (!motor_run_segment(motor_index, true, duration_us, snapshot.dir_setup_us)) {
                     break;
                 }
 
-                if (!motion_wait_pause(snapshot.pause_ms)) {
+                if (!motion_wait_pause(motor_index, snapshot.pause_ms)) {
                     break;
                 }
 
-                snapshot = state_snapshot();
+                snapshot = motor_snapshot(motor_index);
                 if (!snapshot.auto_mode) {
                     break;
                 }
 
-                motor_apply_pwm_period(snapshot.step_period_us);
-                if (!motor_run_segment(false, duration_us, snapshot.dir_setup_us)) {
+                motor_apply_pwm_period(motor_index, snapshot.step_period_us);
+                if (!motor_run_segment(motor_index, false, duration_us, snapshot.dir_setup_us)) {
                     break;
                 }
 
-                if (!motion_wait_pause(snapshot.pause_ms)) {
+                if (!motion_wait_pause(motor_index, snapshot.pause_ms)) {
                     break;
                 }
             }
 
-            motor_stop_output();
+            motor_stop_output(motor_index);
             xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-            set_activity_idle(&g_state);
+            set_activity_idle(&g_motors[motor_index].state);
             xSemaphoreGive(g_state_mutex);
             continue;
         }
@@ -1313,33 +1439,69 @@ static esp_err_t send_text(httpd_req_t *req, const char *text)
     return httpd_resp_send(req, text, HTTPD_RESP_USE_STRLEN);
 }
 
-static void build_state_json(char *buf, size_t len)
+static void build_motor_json(char *buf, size_t len, size_t motor_index)
 {
-    const app_state_t s = state_snapshot();
+    const motor_state_t s = motor_snapshot(motor_index);
     const uint64_t duration_us = motion_duration_us_from_state(&s);
     const uint32_t move_duration_ms = (uint32_t)((duration_us + 999ULL) / 1000ULL);
     const uint32_t freq_hz = step_frequency_hz_from_period(s.step_period_us);
+
+    snprintf(buf, len,
+             "{"
+             "\"id\":%u,"
+             "\"profile\":\"%s\","
+             "\"auto_mode\":%s,"
+             "\"running\":%s,"
+             "\"activity\":\"%s\","
+             "\"pending_action\":\"%s\","
+             "\"step_gpio\":%d,"
+             "\"dir_gpio\":%d,"
+             "\"en_gpio\":%d,"
+             "\"step_period_us\":%" PRIu32 ","
+             "\"step_frequency_hz\":%" PRIu32 ","
+             "\"rpm\":%" PRIu32 ","
+             "\"move_time_ms\":%" PRIu32 ","
+             "\"move_steps\":%" PRIu32 ","
+             "\"move_duration_ms\":%" PRIu32 ","
+             "\"pause_ms\":%" PRIu32 ","
+             "\"dir_setup_us\":%" PRIu32 "}",
+             (unsigned)(motor_index + 1U),
+             motion_profile_to_string(s.profile),
+             bool_to_json(s.auto_mode),
+             bool_to_json(s.running),
+             motor_activity_to_string(s.activity),
+             motor_action_to_string(s.pending_action),
+             g_motors[motor_index].hw.step_gpio,
+             g_motors[motor_index].hw.dir_gpio,
+             g_motors[motor_index].hw.en_gpio,
+             s.step_period_us,
+             freq_hz,
+             s.rpm,
+             s.move_time_ms,
+             s.move_steps,
+             move_duration_ms,
+             s.pause_ms,
+             s.dir_setup_us);
+}
+
+static void build_state_json(char *buf, size_t len)
+{
+    const app_state_t s = state_snapshot();
     const esp_app_desc_t *app_desc = esp_app_get_description();
     const esp_partition_t *running_partition = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
     const bool ota_pending_verify = (running_partition != NULL && esp_ota_get_state_partition(running_partition, &ota_state) == ESP_OK && ota_state == ESP_OTA_IMG_PENDING_VERIFY);
     const char *firmware_version = (app_desc != NULL) ? app_desc->version : "unknown";
     const char *running_partition_label = partition_label_or_unknown(running_partition);
+    char motor1[512];
+    char motor2[512];
+    build_motor_json(motor1, sizeof(motor1), 0U);
+    build_motor_json(motor2, sizeof(motor2), 1U);
 
     snprintf(buf, len,
              "{"
-             "\"profile\":\"%s\","
-             "\"auto_mode\":%s,"
-             "\"running\":%s,"
-             "\"activity\":\"%s\","
-             "\"pending_action\":\"%s\","
-             "\"step_period_us\":%" PRIu32 ","
-             "\"step_frequency_hz\":%" PRIu32 ","
-             "\"move_time_ms\":%" PRIu32 ","
-             "\"move_steps\":%" PRIu32 ","
-             "\"move_duration_ms\":%" PRIu32 ","
-             "\"pause_ms\":%" PRIu32 ","
-             "\"dir_setup_us\":%" PRIu32 ","
+             "\"motor1\":%s,"
+             "\"motor2\":%s,"
              "\"wifi_sta_connected\":%s,"
              "\"wifi_sta_ip\":\"%s\","
              "\"wifi_ap_started\":%s,"
@@ -1352,18 +1514,8 @@ static void build_state_json(char *buf, size_t len)
              "\"running_partition\":\"%s\","
              "\"ota_pending_verify\":%s"
              "}",
-             motion_profile_to_string(s.profile),
-             bool_to_json(s.auto_mode),
-             bool_to_json(s.running),
-             motor_activity_to_string(s.activity),
-             motor_action_to_string(s.pending_action),
-             s.step_period_us,
-             freq_hz,
-             s.move_time_ms,
-             s.move_steps,
-             move_duration_ms,
-             s.pause_ms,
-             s.dir_setup_us,
+             motor1,
+             motor2,
              bool_to_json(s.wifi_sta_connected),
              s.wifi_sta_ip,
              bool_to_json(s.wifi_ap_started),
@@ -1428,7 +1580,11 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid request body");
     }
 
-    app_state_t snapshot = state_snapshot();
+    uint32_t motor_value = 1U;
+    (void)json_get_uint32_field(body, "motor", &motor_value);
+    const size_t motor_index = motor_index_from_request(motor_value);
+
+    motor_state_t snapshot = motor_snapshot(motor_index);
     uint32_t value;
     char str[64];
 
@@ -1438,6 +1594,12 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 
     if (json_get_uint32_field(body, "step_period_us", &value)) {
         snapshot.step_period_us = clamp_u32(value, 50U, 1000000U);
+        snapshot.rpm = rpm_from_step_period_us(snapshot.step_period_us);
+    }
+
+    if (json_get_uint32_field(body, "rpm", &value)) {
+        snapshot.rpm = clamp_u32(value, 1U, MOTOR_MAX_RPM);
+        snapshot.step_period_us = step_period_us_from_rpm(snapshot.rpm);
     }
 
     if (json_get_uint32_field(body, "move_time_ms", &value)) {
@@ -1457,16 +1619,17 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     }
 
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-    g_state.profile = snapshot.profile;
-    g_state.step_period_us = snapshot.step_period_us;
-    g_state.move_time_ms = snapshot.move_time_ms;
-    g_state.move_steps = snapshot.move_steps;
-    g_state.pause_ms = snapshot.pause_ms;
-    g_state.dir_setup_us = snapshot.dir_setup_us;
+    g_motors[motor_index].state.profile = snapshot.profile;
+    g_motors[motor_index].state.step_period_us = snapshot.step_period_us;
+    g_motors[motor_index].state.rpm = snapshot.rpm;
+    g_motors[motor_index].state.move_time_ms = snapshot.move_time_ms;
+    g_motors[motor_index].state.move_steps = snapshot.move_steps;
+    g_motors[motor_index].state.pause_ms = snapshot.pause_ms;
+    g_motors[motor_index].state.dir_setup_us = snapshot.dir_setup_us;
     xSemaphoreGive(g_state_mutex);
 
     free(body);
-    notify_motor_task();
+    notify_motor_task(motor_index);
 
     char json[1024];
     build_state_json(json, sizeof(json));
@@ -1479,6 +1642,10 @@ static esp_err_t control_post_handler(httpd_req_t *req)
     if (body == NULL) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid request body");
     }
+
+    uint32_t motor_value = 1U;
+    (void)json_get_uint32_field(body, "motor", &motor_value);
+    const size_t motor_index = motor_index_from_request(motor_value);
 
     char action[32];
     if (!json_get_string_field(body, "action", action, sizeof(action))) {
@@ -1506,15 +1673,15 @@ static esp_err_t control_post_handler(httpd_req_t *req)
     }
 
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-    g_state.pending_action = pending;
-    g_state.auto_mode = auto_mode;
+    g_motors[motor_index].state.pending_action = pending;
+    g_motors[motor_index].state.auto_mode = auto_mode;
     if (pending == MOTOR_ACTION_STOP) {
-        g_state.auto_mode = false;
+        g_motors[motor_index].state.auto_mode = false;
     }
     xSemaphoreGive(g_state_mutex);
 
     free(body);
-    notify_motor_task();
+    notify_motor_task(motor_index);
 
     char json[1024];
     build_state_json(json, sizeof(json));
@@ -1523,6 +1690,7 @@ static esp_err_t control_post_handler(httpd_req_t *req)
 
 static esp_err_t wifi_get_handler(httpd_req_t *req)
 {
+
     char json[1024];
     build_wifi_json(json, sizeof(json));
     return send_json(req, json);
@@ -1704,8 +1872,23 @@ static void wifi_start(void)
 
 static void motor_setup(void)
 {
+    g_motors[0].hw.step_gpio = MOTOR1_STEP_GPIO;
+    g_motors[0].hw.dir_gpio = MOTOR1_DIR_GPIO;
+    g_motors[0].hw.en_gpio = MOTOR1_EN_GPIO;
+    g_motors[0].hw.channel = LEDC_CHANNEL_0;
+    g_motors[0].hw.timer = LEDC_TIMER_0;
+    g_motors[0].hw.task_handle = NULL;
+
+    g_motors[1].hw.step_gpio = MOTOR2_STEP_GPIO;
+    g_motors[1].hw.dir_gpio = MOTOR2_DIR_GPIO;
+    g_motors[1].hw.en_gpio = MOTOR2_EN_GPIO;
+    g_motors[1].hw.channel = LEDC_CHANNEL_1;
+    g_motors[1].hw.timer = LEDC_TIMER_1;
+    g_motors[1].hw.task_handle = NULL;
+
     gpio_config_t io = {
-        .pin_bit_mask = (1ULL << STEP_GPIO) | (1ULL << DIR_GPIO) | (1ULL << EN_GPIO),
+        .pin_bit_mask = (1ULL << g_motors[0].hw.step_gpio) | (1ULL << g_motors[0].hw.dir_gpio) | (1ULL << g_motors[0].hw.en_gpio) |
+                        (1ULL << g_motors[1].hw.step_gpio) | (1ULL << g_motors[1].hw.dir_gpio) | (1ULL << g_motors[1].hw.en_gpio),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -1713,28 +1896,48 @@ static void motor_setup(void)
     };
     ESP_ERROR_CHECK(gpio_config(&io));
 
-    gpio_set_level(STEP_GPIO, 0);
-    gpio_set_level(DIR_GPIO, 0);
-    motor_enable(false);
+    for (size_t i = 0; i < 2; ++i) {
+        gpio_set_level(g_motors[i].hw.step_gpio, 0);
+        gpio_set_level(g_motors[i].hw.dir_gpio, 0);
+        motor_enable(i, false);
+    }
 
-    ledc_channel_config_t channel = {
-        .gpio_num = STEP_GPIO,
-        .speed_mode = LEDC_SPEED_MODE,
-        .channel = LEDC_CHANNEL_NUM,
+    ledc_channel_config_t channel_1 = {
+        .gpio_num = g_motors[0].hw.step_gpio,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = g_motors[0].hw.channel,
         .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = LEDC_TIMER_NUM,
+        .timer_sel = g_motors[0].hw.timer,
         .duty = 0,
         .hpoint = 0,
     };
-    ESP_ERROR_CHECK(ledc_channel_config(&channel));
+    ESP_ERROR_CHECK(ledc_channel_config(&channel_1));
 
-    motor_apply_pwm_period(g_state.step_period_us);
-    motor_stop_output();
+    ledc_channel_config_t channel_2 = {
+        .gpio_num = g_motors[1].hw.step_gpio,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = g_motors[1].hw.channel,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = g_motors[1].hw.timer,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&channel_2));
 
-    ESP_LOGI(TAG, "Pins STEP=%d DIR=%d EN=%d", STEP_GPIO, DIR_GPIO, EN_GPIO);
+    for (size_t i = 0; i < 2; ++i) {
+        motor_apply_pwm_period(i, g_motors[i].state.step_period_us);
+        motor_stop_output(i);
+    }
+
+    ESP_LOGI(TAG, "Motor 1 pins STEP=%d DIR=%d EN=%d", MOTOR1_STEP_GPIO, MOTOR1_DIR_GPIO, MOTOR1_EN_GPIO);
+    ESP_LOGI(TAG, "Motor 2 pins STEP=%d DIR=%d EN=%d", MOTOR2_STEP_GPIO, MOTOR2_DIR_GPIO, MOTOR2_EN_GPIO);
     ESP_LOGI(TAG, "Enable pin is %s", EN_ACTIVE_LOW ? "active-low" : "active-high");
-    ESP_LOGI(TAG, "Defaults: profile=%s step_period=%" PRIu32 " us move_time=%" PRIu32 " ms move_steps=%" PRIu32 " pause=%" PRIu32 " ms",
-             motion_profile_to_string(g_state.profile), g_state.step_period_us, g_state.move_time_ms, g_state.move_steps, g_state.pause_ms);
+    ESP_LOGI(TAG, "Defaults: motor1 profile=%s rpm=%" PRIu32 " step_period=%" PRIu32 " us move_time=%" PRIu32 " ms move_steps=%" PRIu32 " pause=%" PRIu32 " ms",
+             motion_profile_to_string(g_motors[0].state.profile), g_motors[0].state.rpm, g_motors[0].state.step_period_us, g_motors[0].state.move_time_ms,
+             g_motors[0].state.move_steps, g_motors[0].state.pause_ms);
+    ESP_LOGI(TAG, "Defaults: motor2 profile=%s rpm=%" PRIu32 " step_period=%" PRIu32 " us move_time=%" PRIu32 " ms move_steps=%" PRIu32 " pause=%" PRIu32 " ms",
+             motion_profile_to_string(g_motors[1].state.profile), g_motors[1].state.rpm, g_motors[1].state.step_period_us, g_motors[1].state.move_time_ms,
+             g_motors[1].state.move_steps, g_motors[1].state.pause_ms);
 }
 
 void app_main(void)
@@ -1756,8 +1959,10 @@ void app_main(void)
     start_http_server();
     ota_mark_app_valid_if_pending();
 
-    xTaskCreate(motor_task, "motor_task", 4096, NULL, 5, &g_motor_task_handle);
-    motor_enable(true);
+    xTaskCreate(motor_task, "motor1_task", 4096, (void *)0, 5, &g_motors[0].hw.task_handle);
+    xTaskCreate(motor_task, "motor2_task", 4096, (void *)1, 5, &g_motors[1].hw.task_handle);
+    motor_enable(0, true);
+    motor_enable(1, true);
 
     ESP_LOGI(TAG, "HTTP server ready: http://%s/", HOSTNAME);
     ESP_LOGI(TAG, "API endpoints: GET /api/health, GET /api/state, POST /api/config, POST /api/control, GET /api/wifi, POST /api/wifi, GET /api/ota, POST /api/ota");
