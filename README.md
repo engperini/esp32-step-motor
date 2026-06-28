@@ -1,6 +1,8 @@
 # esp32-step-motor
 
-ESP-IDF firmware for a **TMC2208 stepper driver** running on a **Seeed XIAO ESP32S3 Sense**.
+ESP-IDF firmware for **two independent TMC2208 stepper drivers** running on a **Seeed XIAO ESP32S3 Sense**.
+
+![Dual motor wiring diagram](assets/dual-motor-wiring.svg)
 
 The project provides:
 
@@ -8,9 +10,10 @@ The project provides:
 - a built-in HTTP server
 - a local web control page
 - a JSON API for automation and integrations
-- manual jog control
-- automatic back-and-forth motion
+- manual jog control for each motor
+- automatic back-and-forth motion for each motor
 - motion profiles based on **time** or **steps**
+- independent configuration and commands per motor
 - Wi-Fi configuration from the web UI
 - an **emergency AP** for recovery and local access
 
@@ -20,9 +23,10 @@ The project provides:
 
 The default pins are defined in `main/main.c`:
 
-- `STEP_GPIO = GPIO_NUM_4`
-- `DIR_GPIO = GPIO_NUM_5`
-- `EN_GPIO = GPIO_NUM_6`
+| Motor | STEP | DIR | EN |
+|---|---:|---:|---:|
+| Motor 1 | GPIO4 | GPIO5 | GPIO6 |
+| Motor 2 | GPIO7 | GPIO8 | GPIO9 |
 
 The TMC2208 enable pin is **active-low** by default.
 
@@ -87,11 +91,12 @@ The web page lets you:
 ### Motion settings
 
 - choose the motion profile: `time` or `steps`
-- set `step_period_us`
+- set `rpm`
 - set `move_time_ms`
 - set `move_steps`
 - set `pause_ms`
 - set `dir_setup_us`
+- apply settings separately to **Motor 1** and **Motor 2**
 
 ### Wi-Fi settings
 
@@ -102,24 +107,22 @@ The web page lets you:
 
 ### Manual control
 
-- `Jog forward`
-- `Jog reverse`
-- `Stop`
-- `Start auto`
-- `Stop auto`
+- `Jog forward` / `Jog reverse` / `Stop` for each motor
+- `Start auto` / `Stop auto` for each motor
 
 ### Live status
 
 The page also shows:
 
-- motor state
-- auto/manual state
-- active motion profile
+- motor 1 state
+- motor 2 state
+- RPM for each motor
+- active motion profile for each motor
 - current Wi-Fi mode
 - AP status
 - STA connection status
 - current IP addresses
-- pending action state
+- pending action state per motor
 
 ---
 
@@ -133,6 +136,8 @@ Available endpoints:
 - `POST /api/control`
 - `GET /api/wifi`
 - `POST /api/wifi`
+
+The motion endpoints accept a `motor` field (`1` or `2`) so each actuator can be configured and commanded independently.
 
 ---
 

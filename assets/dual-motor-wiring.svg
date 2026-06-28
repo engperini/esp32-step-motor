@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700">
+  <defs>
+    <style>
+      .bg { fill: #0f172a; }
+      .panel { fill: #111827; stroke: #334155; stroke-width: 2; rx: 18; ry: 18; }
+      .box { fill: #1f2937; stroke: #64748b; stroke-width: 2; rx: 14; ry: 14; }
+      .title { fill: #e2e8f0; font: 700 26px sans-serif; }
+      .label { fill: #cbd5e1; font: 600 18px sans-serif; }
+      .text { fill: #e5e7eb; font: 16px monospace; }
+      .small { fill: #94a3b8; font: 14px sans-serif; }
+      .wire1 { stroke: #38bdf8; stroke-width: 4; fill: none; }
+      .wire2 { stroke: #a78bfa; stroke-width: 4; fill: none; }
+      .wire3 { stroke: #34d399; stroke-width: 4; fill: none; }
+      .wireG { stroke: #f59e0b; stroke-width: 4; fill: none; }
+      .pin { fill: #e2e8f0; font: 700 15px monospace; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1200" height="700"/>
+  <text x="60" y="56" class="title">ESP32-S3 XIAO Sense + 2x TCM2208 stepper drivers</text>
+  <text x="60" y="84" class="small">Independent motors: separate pins, separate commands, separate configuration</text>
+
+  <rect class="box" x="70" y="160" width="260" height="250"/>
+  <text x="100" y="198" class="label">XIAO ESP32-S3</text>
+  <text x="100" y="236" class="pin">Motor 1</text>
+  <text x="120" y="264" class="text">GPIO4  → STEP</text>
+  <text x="120" y="292" class="text">GPIO5  → DIR</text>
+  <text x="120" y="320" class="text">GPIO6  → EN</text>
+  <text x="100" y="360" class="pin">Motor 2</text>
+  <text x="120" y="388" class="text">GPIO7  → STEP</text>
+  <text x="120" y="416" class="text">GPIO8  → DIR</text>
+  <text x="120" y="444" class="text">GPIO9  → EN</text>
+
+  <rect class="box" x="470" y="145" width="250" height="280"/>
+  <text x="520" y="185" class="label">TCM2208 #1</text>
+  <text x="505" y="225" class="text">STEP</text>
+  <text x="505" y="265" class="text">DIR</text>
+  <text x="505" y="305" class="text">EN</text>
+  <text x="505" y="365" class="small">Motor 1 driver</text>
+
+  <rect class="box" x="470" y="465" width="250" height="150"/>
+  <text x="520" y="505" class="label">TCM2208 #2</text>
+  <text x="505" y="545" class="text">STEP</text>
+  <text x="505" y="575" class="text">DIR</text>
+  <text x="505" y="605" class="text">EN</text>
+
+  <rect class="box" x="860" y="190" width="260" height="210"/>
+  <text x="905" y="232" class="label">Motor 1</text>
+  <text x="895" y="272" class="text">Coil A / Coil B</text>
+  <text x="895" y="304" class="small">Separate mechanical axis</text>
+
+  <rect class="box" x="860" y="495" width="260" height="140"/>
+  <text x="905" y="535" class="label">Motor 2</text>
+  <text x="895" y="575" class="text">Coil A / Coil B</text>
+  <text x="895" y="607" class="small">Independent axis</text>
+
+  <!-- Wires motor 1 -->
+  <path class="wire1" d="M330 264 C390 264, 410 225, 470 225"/>
+  <path class="wire2" d="M330 292 C390 292, 410 265, 470 265"/>
+  <path class="wire3" d="M330 320 C390 320, 410 305, 470 305"/>
+  <path class="wireG" d="M330 348 C410 348, 430 348, 470 348"/>
+
+  <!-- Wires motor 2 -->
+  <path class="wire1" d="M330 388 C390 388, 410 545, 470 545"/>
+  <path class="wire2" d="M330 416 C390 416, 410 575, 470 575"/>
+  <path class="wire3" d="M330 444 C390 444, 410 605, 470 605"/>
+  <path class="wireG" d="M330 472 C410 472, 430 625, 470 625"/>
+
+  <!-- Output wires -->
+  <path class="wire1" d="M720 225 C790 225, 800 245, 860 245"/>
+  <path class="wire2" d="M720 265 C790 265, 800 275, 860 275"/>
+  <path class="wire3" d="M720 305 C790 305, 800 305, 860 305"/>
+
+  <path class="wire1" d="M720 545 C790 545, 800 555, 860 555"/>
+  <path class="wire2" d="M720 575 C790 575, 800 585, 860 585"/>
+  <path class="wire3" d="M720 605 C790 605, 800 615, 860 615"/>
+
+  <text x="70" y="660" class="small">EN is active-low in firmware: LOW enables the driver, HIGH disables it.</text>
+</svg>
