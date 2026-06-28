@@ -10,6 +10,10 @@ sdkconfig.old
 __pycache__/
 .pytest_cache/
 
+# Local secrets
+.env
+.env.*
+
 # Editor files
 .vscode/
 .idea/
