@@ -321,17 +321,40 @@ static const char INDEX_HTML[] =
 "      return res.json();\n"
 "    }\n"
 "\n"
+"    const dirtyFields = new Set();\n"
+"\n"
+"    function markFieldDirty(el) {\n"
+"      if (el && el.id) {\n"
+"        dirtyFields.add(el.id);\n"
+"      }\n"
+"    }\n"
+"\n"
+"    function clearDirtyFields() {\n"
+"      dirtyFields.clear();\n"
+"    }\n"
+"\n"
+"    function syncField(id, value) {\n"
+"      const el = document.getElementById(id);\n"
+"      if (!el) return;\n"
+"      if (dirtyFields.has(id)) return;\n"
+"      if (document.activeElement === el) return;\n"
+"      const next = String(value);\n"
+"      if (el.value !== next) {\n"
+"        el.value = next;\n"
+"      }\n"
+"    }\n"
+"\n"
 "    async function refreshState() {\n"
 "      const state = await api('/api/state');\n"
 "      document.getElementById('json').textContent = JSON.stringify(state, null, 2);\n"
-"      document.getElementById('profile').value = state.profile;\n"
-"      document.getElementById('step_period_us').value = state.step_period_us;\n"
-"      document.getElementById('move_time_ms').value = state.move_time_ms;\n"
-"      document.getElementById('move_steps').value = state.move_steps;\n"
-"      document.getElementById('pause_ms').value = state.pause_ms;\n"
-"      document.getElementById('dir_setup_us').value = state.dir_setup_us;\n"
-"      document.getElementById('wifi_mode').value = state.wifi_mode;\n"
-"      document.getElementById('wifi_ssid').value = state.wifi_ssid;\n"
+"      syncField('profile', state.profile);\n"
+"      syncField('step_period_us', state.step_period_us);\n"
+"      syncField('move_time_ms', state.move_time_ms);\n"
+"      syncField('move_steps', state.move_steps);\n"
+"      syncField('pause_ms', state.pause_ms);\n"
+"      syncField('dir_setup_us', state.dir_setup_us);\n"
+"      syncField('wifi_mode', state.wifi_mode);\n"
+"      syncField('wifi_ssid', state.wifi_ssid);\n"
 "\n"
 "      const wifi = state.wifi_sta_connected ? ('STA ' + state.wifi_sta_ip) : 'STA desconectado';\n"
 "      const ap = state.wifi_ap_started ? ('AP ' + state.wifi_ap_ip) : 'AP off';\n"
@@ -359,6 +382,7 @@ static const char INDEX_HTML[] =
 "        pause_ms: parseInt(document.getElementById('pause_ms').value, 10),\n"
 "        dir_setup_us: parseInt(document.getElementById('dir_setup_us').value, 10)\n"
 "      });\n"
+"      clearDirtyFields();\n"
 "      await refreshState();\n"
 "    }\n"
 "\n"
@@ -369,6 +393,7 @@ static const char INDEX_HTML[] =
 "        password: document.getElementById('wifi_password').value\n"
 "      });\n"
 "      document.getElementById('wifi_password').value = '';\n"
+"      clearDirtyFields();\n"
 "      await refreshState();\n"
 "    }\n"
 "\n"
@@ -376,6 +401,11 @@ static const char INDEX_HTML[] =
 "      await api('/api/control', { action });\n"
 "      await refreshState();\n"
 "    }\n"
+"\n"
+"    document.querySelectorAll('input, select').forEach((el) => {\n"
+"      el.addEventListener('input', () => markFieldDirty(el));\n"
+"      el.addEventListener('change', () => markFieldDirty(el));\n"
+"    });\n"
 "\n"
 "    refreshState().catch(console.error);\n"
 "    setInterval(() => refreshState().catch(console.error), 1000);\n"
@@ -559,6 +589,16 @@ static void wifi_build_sta_config(wifi_config_t *sta_config)
     sta_config->sta.pmf_cfg.required = false;
 }
 
+static void wifi_request_sta_connect(void)
+{
+    esp_err_t err = esp_wifi_connect();
+    if (err == ESP_OK || err == ESP_ERR_WIFI_CONN) {
+        return;
+    }
+
+    ESP_ERROR_CHECK(err);
+}
+
 static void wifi_apply_settings(bool stop_first)
 {
     wifi_config_t ap_config;
@@ -584,7 +624,7 @@ static void wifi_apply_settings(bool stop_first)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     if (use_sta) {
-        ESP_ERROR_CHECK(esp_wifi_connect());
+        wifi_request_sta_connect();
     }
 
     update_ap_ip_from_netif();
@@ -1329,13 +1369,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         if (wifi_should_use_sta()) {
-            esp_wifi_connect();
+            wifi_request_sta_connect();
         }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         update_sta_disconnected();
         if (wifi_should_use_sta()) {
             ESP_LOGW(TAG, "Wi-Fi disconnected, reconnecting...");
-            esp_wifi_connect();
+            wifi_request_sta_connect();
         }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {
         update_ap_ip_from_netif();
