@@ -16,6 +16,9 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "lwip/inet.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
@@ -178,6 +181,7 @@ static const char INDEX_HTML[] =
 "    details { margin-top: 10px; }\n"
 "    summary { cursor: pointer; font-weight: 600; }\n"
 "    ol { margin-top: 0.5rem; }\n"
+"    progress { width: 100%; height: 18px; }\n"
 "  </style>\n"
 "</head>\n"
 "<body>\n"
@@ -303,8 +307,27 @@ static const char INDEX_HTML[] =
 "          <li><code>POST /api/control</code></li>\n"
 "          <li><code>GET /api/wifi</code></li>\n"
 "          <li><code>POST /api/wifi</code></li>\n"
+"          <li><code>GET /api/ota</code></li>\n"
+"          <li><code>POST /api/ota</code></li>\n"
 "        </ul>\n"
 "      </details>\n"
+"    </section>\n"
+"\n"
+"    <section class='card'>\n"
+"      <h2>Firmware update (OTA)</h2>\n"
+"      <p class='muted'>Upload a firmware .bin file. The device writes it to the alternate OTA slot, marks it for boot, and reboots automatically. The emergency AP stays available.</p>\n"
+"      <div class='grid'>\n"
+"        <label>Firmware image\n"
+"          <input id='ota_file' type='file' accept='.bin,application/octet-stream' onchange='onOtaFileSelected()'>\n"
+"        </label>\n"
+"      </div>\n"
+"      <div id='ota_file_info' class='muted' style='margin-top:8px'>No firmware image selected.</div>\n"
+"      <div class='row' style='margin-top:12px'>\n"
+"        <button class='primary' onclick='uploadOta()'>Upload and reboot</button>\n"
+"        <button onclick='refreshOtaStatus()'>Refresh OTA status</button>\n"
+"      </div>\n"
+"      <div id='ota_status' class='muted' style='margin-top:8px'>Ready.</div>\n"
+"      <progress id='ota_progress' value='0' max='100' style='display:none;'></progress>\n"
 "    </section>\n"
 "\n"
 "    <section class='card'>\n"
@@ -371,6 +394,77 @@ static const char INDEX_HTML[] =
 "        <span class='pill'>emergency AP ${state.wifi_emergency_ap ? 'on' : 'off'}</span>\n"
 "        <span class='pill'>pending ${state.pending_action}</span>\n"
 "      `;\n"
+"      refreshOtaStatus().catch(console.error);\n"
+"    }\n"
+"\n"
+"    async function refreshOtaStatus() {\n"
+"      const state = await api('/api/ota');\n"
+"      const parts = [];\n"
+"      parts.push(`version ${state.firmware_version}`);\n"
+"      parts.push(`running ${state.running_partition}`);\n"
+"      parts.push(`update ${state.next_partition}`);\n"
+"      parts.push(state.pending_verify ? 'pending verify' : 'confirmed');\n"
+"      parts.push(state.ota_supported ? `slot ${state.slot_size} bytes` : 'OTA disabled');\n"
+"      document.getElementById('ota_status').textContent = parts.join(' • ');\n"
+"    }\n"
+"\n"
+"    function onOtaFileSelected() {\n"
+"      const input = document.getElementById('ota_file');\n"
+"      const info = document.getElementById('ota_file_info');\n"
+"      const file = input.files && input.files[0];\n"
+"      if (!file) {\n"
+"        info.textContent = 'No firmware image selected.';\n"
+"        return;\n"
+"      }\n"
+"      const sizeKb = Math.round(file.size / 1024);\n"
+"      info.textContent = `Selected: ${file.name} (${sizeKb} KB)`;\n"
+"    }\n"
+"\n"
+"    async function uploadOta() {\n"
+"      const input = document.getElementById('ota_file');\n"
+"      const file = input.files && input.files[0];\n"
+"      const status = document.getElementById('ota_status');\n"
+"      const progress = document.getElementById('ota_progress');\n"
+"      if (!file) {\n"
+"        status.textContent = 'Select a .bin firmware image first.';\n"
+"        return;\n"
+"      }\n"
+"\n"
+"      progress.style.display = 'block';\n"
+"      progress.value = 0;\n"
+"      status.textContent = 'Uploading firmware...';\n"
+"\n"
+"      await new Promise((resolve, reject) => {\n"
+"        const xhr = new XMLHttpRequest();\n"
+"        xhr.open('POST', '/api/ota');\n"
+"        xhr.responseType = 'json';\n"
+"        xhr.setRequestHeader('Content-Type', 'application/octet-stream');\n"
+"        xhr.upload.onprogress = (event) => {\n"
+"          if (event.lengthComputable) {\n"
+"            progress.value = Math.round((event.loaded / event.total) * 100);\n"
+"            status.textContent = `Uploading firmware... ${progress.value}%`;\n"
+"          }\n"
+"        };\n"
+"        xhr.onload = () => {\n"
+"          progress.style.display = 'none';\n"
+"          if (xhr.status >= 200 && xhr.status < 300) {\n"
+"            status.textContent = 'Upload complete. The board will reboot into the new firmware.';\n"
+"            input.value = '';\n"
+"            refreshOtaStatus().catch(() => {});\n"
+"            resolve();\n"
+"          } else {\n"
+"            const message = (xhr.response && xhr.response.message) || xhr.responseText || `HTTP ${xhr.status}`;\n"
+"            status.textContent = `OTA failed: ${message}`;\n"
+"            reject(new Error(message));\n"
+"          }\n"
+"        };\n"
+"        xhr.onerror = () => {\n"
+"          progress.style.display = 'none';\n"
+"          status.textContent = 'OTA upload failed due to a network error.';\n"
+"          reject(new Error('network error'));\n"
+"        };\n"
+"        xhr.send(file);\n"
+"      });\n"
 "    }\n"
 "\n"
 "    async function saveMotionConfig() {\n"
@@ -629,6 +723,144 @@ static void wifi_apply_settings(bool stop_first)
 
     update_ap_ip_from_netif();
     wifi_settings_apply_to_state();
+}
+
+static esp_err_t send_json(httpd_req_t *req, const char *json);
+
+static const char *partition_label_or_unknown(const esp_partition_t *partition)
+{
+    return (partition != NULL && partition->label[0] != '\0') ? partition->label : "unknown";
+}
+
+static void ota_reboot_task(void *arg)
+{
+    const uint32_t delay_ms = (uint32_t)(uintptr_t)arg;
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    esp_restart();
+    vTaskDelete(NULL);
+}
+
+static void ota_schedule_reboot(uint32_t delay_ms)
+{
+    (void)xTaskCreate(ota_reboot_task, "ota_reboot", 2048, (void *)(uintptr_t)delay_ms, 5, NULL);
+}
+
+static void ota_mark_app_valid_if_pending(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running == NULL) {
+        return;
+    }
+
+    esp_ota_img_states_t ota_state;
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK && ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Confirmed OTA image as valid");
+        } else {
+            ESP_LOGW(TAG, "Failed to confirm OTA image: %s", esp_err_to_name(err));
+        }
+    }
+}
+
+static void build_ota_json(char *buf, size_t len)
+{
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    esp_ota_img_states_t ota_state;
+    const bool pending_verify = (running != NULL && esp_ota_get_state_partition(running, &ota_state) == ESP_OK && ota_state == ESP_OTA_IMG_PENDING_VERIFY);
+    const char *version = (app_desc != NULL) ? app_desc->version : "unknown";
+    const char *running_label = partition_label_or_unknown(running);
+    const char *next_label = partition_label_or_unknown(next);
+    const uint32_t next_size = (next != NULL) ? (uint32_t)next->size : 0U;
+
+    snprintf(buf, len,
+             "{"
+             "\"ota_supported\":%s,"
+             "\"firmware_version\":\"%s\","
+             "\"running_partition\":\"%s\","
+             "\"next_partition\":\"%s\","
+             "\"slot_size\":%" PRIu32 ","
+             "\"pending_verify\":%s"
+             "}",
+             bool_to_json(next != NULL),
+             version,
+             running_label,
+             next_label,
+             next_size,
+             bool_to_json(pending_verify));
+}
+
+static esp_err_t ota_get_handler(httpd_req_t *req)
+{
+    char json[512];
+    build_ota_json(json, sizeof(json));
+    return send_json(req, json);
+}
+
+static esp_err_t ota_post_handler(httpd_req_t *req)
+{
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no OTA partition available");
+    }
+
+    if (req->content_len == 0U) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty OTA payload");
+    }
+
+    if (req->content_len > update_partition->size) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "image larger than OTA partition");
+    }
+
+    esp_ota_handle_t ota_handle = 0;
+    esp_err_t err = esp_ota_begin(update_partition, req->content_len, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "unable to start OTA update");
+    }
+
+    char buffer[1024];
+    size_t remaining = req->content_len;
+    while (remaining > 0U) {
+        const size_t chunk = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        const int received = httpd_req_recv(req, buffer, chunk);
+        if (received <= 0) {
+            ESP_LOGE(TAG, "OTA receive failed: %d", received);
+            esp_ota_abort(ota_handle);
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA upload interrupted");
+        }
+
+        err = esp_ota_write(ota_handle, buffer, (size_t)received);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+            esp_ota_abort(ota_handle);
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+        }
+
+        remaining -= (size_t)received;
+    }
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA finalize failed");
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "unable to set boot partition");
+    }
+
+    char json[512];
+    snprintf(json, sizeof(json), "{\"status\":\"ok\",\"message\":\"OTA update accepted\",\"rebooting_in_ms\":1500,\"target_partition\":\"%s\"}", partition_label_or_unknown(update_partition));
+    esp_err_t send_err = send_json(req, json);
+    if (send_err == ESP_OK) {
+        ota_schedule_reboot(1500U);
+    }
+    return send_err;
 }
 
 static void state_init_defaults(void)
@@ -1042,6 +1274,12 @@ static void build_state_json(char *buf, size_t len)
     const uint64_t duration_us = motion_duration_us_from_state(&s);
     const uint32_t move_duration_ms = (uint32_t)((duration_us + 999ULL) / 1000ULL);
     const uint32_t freq_hz = step_frequency_hz_from_period(s.step_period_us);
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    const esp_partition_t *running_partition = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+    const bool ota_pending_verify = (running_partition != NULL && esp_ota_get_state_partition(running_partition, &ota_state) == ESP_OK && ota_state == ESP_OTA_IMG_PENDING_VERIFY);
+    const char *firmware_version = (app_desc != NULL) ? app_desc->version : "unknown";
+    const char *running_partition_label = partition_label_or_unknown(running_partition);
 
     snprintf(buf, len,
              "{"
@@ -1064,7 +1302,10 @@ static void build_state_json(char *buf, size_t len)
              "\"wifi_mode\":\"%s\","
              "\"wifi_ssid\":\"%s\","
              "\"wifi_emergency_ap\":%s,"
-             "\"hostname\":\"%s\""
+             "\"hostname\":\"%s\","
+             "\"firmware_version\":\"%s\","
+             "\"running_partition\":\"%s\","
+             "\"ota_pending_verify\":%s"
              "}",
              motion_profile_to_string(s.profile),
              bool_to_json(s.auto_mode),
@@ -1085,7 +1326,10 @@ static void build_state_json(char *buf, size_t len)
              s.wifi_mode,
              s.wifi_ssid,
              bool_to_json(s.wifi_emergency_ap),
-             s.hostname);
+             s.hostname,
+             firmware_version,
+             running_partition_label,
+             bool_to_json(ota_pending_verify));
 }
 
 static void build_wifi_json(char *buf, size_t len)
@@ -1327,6 +1571,9 @@ static void start_http_server(void)
     register_uri(g_http_server, "/api/wifi", HTTP_GET, wifi_get_handler);
     register_uri(g_http_server, "/api/wifi", HTTP_OPTIONS, options_handler);
     register_uri(g_http_server, "/api/wifi", HTTP_POST, wifi_post_handler);
+    register_uri(g_http_server, "/api/ota", HTTP_GET, ota_get_handler);
+    register_uri(g_http_server, "/api/ota", HTTP_OPTIONS, options_handler);
+    register_uri(g_http_server, "/api/ota", HTTP_POST, ota_post_handler);
 }
 
 
@@ -1462,10 +1709,11 @@ void app_main(void)
     motor_setup();
     wifi_start();
     start_http_server();
+    ota_mark_app_valid_if_pending();
 
     xTaskCreate(motor_task, "motor_task", 4096, NULL, 5, &g_motor_task_handle);
     motor_enable(true);
 
     ESP_LOGI(TAG, "HTTP server ready: http://%s/", HOSTNAME);
-    ESP_LOGI(TAG, "API endpoints: GET /api/health, GET /api/state, POST /api/config, POST /api/control, GET /api/wifi, POST /api/wifi");
+    ESP_LOGI(TAG, "API endpoints: GET /api/health, GET /api/state, POST /api/config, POST /api/control, GET /api/wifi, POST /api/wifi, GET /api/ota, POST /api/ota");
 }
