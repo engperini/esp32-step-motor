@@ -24,6 +24,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "index_html.h"
+
 #ifndef MOTOR_STEPS_PER_REV
 #define MOTOR_STEPS_PER_REV 200U
 #endif
@@ -76,6 +78,10 @@
 #define PAUSE_MS 1000U
 #endif
 
+#ifndef HOLD_CHUNK_US
+#define HOLD_CHUNK_US 50000U
+#endif
+
 #ifndef DIR_SETUP_US
 #define DIR_SETUP_US 20U
 #endif
@@ -113,6 +119,8 @@ typedef enum {
     MOTOR_ACTION_NONE = 0,
     MOTOR_ACTION_JOG_FORWARD,
     MOTOR_ACTION_JOG_REVERSE,
+    MOTOR_ACTION_HOLD_FORWARD,
+    MOTOR_ACTION_HOLD_REVERSE,
     MOTOR_ACTION_START_AUTO,
     MOTOR_ACTION_STOP,
 } motor_action_t;
@@ -121,6 +129,7 @@ typedef enum {
     MOTOR_ACTIVITY_IDLE = 0,
     MOTOR_ACTIVITY_RUNNING,
     MOTOR_ACTIVITY_AUTO,
+    MOTOR_ACTIVITY_HOLD,
 } motor_activity_t;
 
 typedef struct {
@@ -132,6 +141,7 @@ typedef struct {
     uint32_t pause_ms;
     uint32_t dir_setup_us;
     bool auto_mode;
+    bool hold_mode;
     bool running;
     motor_activity_t activity;
     motor_action_t pending_action;
@@ -192,451 +202,6 @@ static app_state_t g_state;
 
 static void update_ap_ip_from_netif(void);
 
-static const char INDEX_HTML[] =
-"<!doctype html>\n"
-"<html>\n"
-"<head>\n"
-"  <meta charset='utf-8'>\n"
-"  <meta name='viewport' content='width=device-width, initial-scale=1'>\n"
-"  <title>ESP32 Step Motor</title>\n"
-"  <style>\n"
-"    body { font-family: sans-serif; margin: 0; background: #111827; color: #e5e7eb; }\n"
-"    header { padding: 16px; background: #0f172a; border-bottom: 1px solid #334155; }\n"
-"    main { padding: 16px; max-width: 1000px; margin: 0 auto; display: grid; gap: 16px; }\n"
-"    .card { background: #1f2937; border: 1px solid #374151; border-radius: 14px; padding: 16px; }\n"
-"    .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); }\n"
-"    label { display: grid; gap: 6px; font-size: 14px; }\n"
-"    input, select, button { background: #0b1220; color: #e5e7eb; border: 1px solid #475569; border-radius: 10px; padding: 10px 12px; font-size: 14px; }\n"
-"    button { cursor: pointer; font-weight: 600; }\n"
-"    button.primary { background: #2563eb; border-color: #2563eb; }\n"
-"    button.good { background: #16a34a; border-color: #16a34a; }\n"
-"    button.warn { background: #dc2626; border-color: #dc2626; }\n"
-"    .row { display: flex; flex-wrap: wrap; gap: 10px; }\n"
-"    .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; background: #334155; margin-right: 6px; margin-bottom: 6px; }\n"
-"    .muted { color: #94a3b8; }\n"
-"    pre { white-space: pre-wrap; word-break: break-word; margin: 0; }\n"
-"    code { background: #0b1220; padding: 2px 6px; border-radius: 6px; }\n"
-"    details { margin-top: 10px; }\n"
-"    summary { cursor: pointer; font-weight: 600; }\n"
-"    ol { margin-top: 0.5rem; }\n"
-"    progress { width: 100%; height: 18px; }\n"
-"  </style>\n"
-"</head>\n"
-"<body>\n"
-"  <header>\n"
-"    <h1>ESP32 Step Motor</h1>\n"
-"    <div class='muted'>HTTP API + local control page</div>\n"
-"  </header>\n"
-"  <main>\n"
-"    <section class='card'>\n"
-"      <h2>Motor 1</h2>\n"
-"      <div class='grid'>\n"
-"        <label>Profile\n"
-"          <select id='m1_profile'>\n"
-"            <option value='time'>time</option>\n"
-"            <option value='steps'>steps</option>\n"
-"          </select>\n"
-"        </label>\n"
-"        <label>RPM\n"
-"          <input id='m1_rpm' type='number' min='1' max='300' step='1' value='300'>\n"
-"        </label>\n"
-"        <label>Move time (ms)\n"
-"          <input id='m1_move_time_ms' type='number' min='0' step='1' value='5000'>\n"
-"        </label>\n"
-"        <label>Steps per move\n"
-"          <input id='m1_move_steps' type='number' min='0' step='1' value='200'>\n"
-"        </label>\n"
-"        <label>Pause (ms)\n"
-"          <input id='m1_pause_ms' type='number' min='0' step='1' value='1000'>\n"
-"        </label>\n"
-"        <label>Dir setup (us)\n"
-"          <input id='m1_dir_setup_us' type='number' min='0' step='1' value='20'>\n"
-"        </label>\n"
-"      </div>\n"
-"      <div class='row' style='margin-top:12px'>\n"
-"        <button class='primary' onclick='saveMotionConfig(1)'>Apply motor 1</button>\n"
-"        <button onclick='refreshState()'>Refresh</button>\n"
-"      </div>\n"
-"      <div class='row' style='margin-top:12px'>\n"
-"        <button class='good' onclick='sendAction(1, \"forward\")'>Jog forward</button>\n"
-"        <button class='good' onclick='sendAction(1, \"reverse\")'>Jog reverse</button>\n"
-"        <button class='warn' onclick='sendAction(1, \"stop\")'>Stop</button>\n"
-"        <button class='primary' onclick='sendAction(1, \"auto_start\")'>Start auto</button>\n"
-"        <button class='warn' onclick='sendAction(1, \"auto_stop\")'>Stop auto</button>\n"
-"      </div>\n"
-"    </section>\n"
-"\n"
-"    <section class='card'>\n"
-"      <h2>Motor 2</h2>\n"
-"      <div class='grid'>\n"
-"        <label>Profile\n"
-"          <select id='m2_profile'>\n"
-"            <option value='time'>time</option>\n"
-"            <option value='steps'>steps</option>\n"
-"          </select>\n"
-"        </label>\n"
-"        <label>RPM\n"
-"          <input id='m2_rpm' type='number' min='1' max='300' step='1' value='300'>\n"
-"        </label>\n"
-"        <label>Move time (ms)\n"
-"          <input id='m2_move_time_ms' type='number' min='0' step='1' value='5000'>\n"
-"        </label>\n"
-"        <label>Steps per move\n"
-"          <input id='m2_move_steps' type='number' min='0' step='1' value='200'>\n"
-"        </label>\n"
-"        <label>Pause (ms)\n"
-"          <input id='m2_pause_ms' type='number' min='0' step='1' value='1000'>\n"
-"        </label>\n"
-"        <label>Dir setup (us)\n"
-"          <input id='m2_dir_setup_us' type='number' min='0' step='1' value='20'>\n"
-"        </label>\n"
-"      </div>\n"
-"      <div class='row' style='margin-top:12px'>\n"
-"        <button class='primary' onclick='saveMotionConfig(2)'>Apply motor 2</button>\n"
-"        <button onclick='refreshState()'>Refresh</button>\n"
-"      </div>\n"
-"      <div class='row' style='margin-top:12px'>\n"
-"        <button class='good' onclick='sendAction(2, \"forward\")'>Jog forward</button>\n"
-"        <button class='good' onclick='sendAction(2, \"reverse\")'>Jog reverse</button>\n"
-"        <button class='warn' onclick='sendAction(2, \"stop\")'>Stop</button>\n"
-"        <button class='primary' onclick='sendAction(2, \"auto_start\")'>Start auto</button>\n"
-"        <button class='warn' onclick='sendAction(2, \"auto_stop\")'>Stop auto</button>\n"
-"      </div>\n"
-"    </section>\n"
-"\n"
-"    <section class='card'>\n"
-"      <h2>Wi-Fi setup</h2>\n"
-"      <p class='muted'>O AP de emergência permanece disponível em <code>192.168.4.1</code> para recuperação e configuração, mesmo quando o modo principal for a rede do roteador.</p>\n"
-"      <div class='grid'>\n"
-"        <label>Modo principal\n"
-"          <select id='wifi_mode'>\n"
-"            <option value='ap'>AP local / emergência</option>\n"
-"            <option value='sta'>Wi-Fi do roteador</option>\n"
-"          </select>\n"
-"        </label>\n"
-"        <label>SSID do roteador\n"
-"          <input id='wifi_ssid' type='text' maxlength='32' placeholder='Minha rede Wi-Fi'>\n"
-"        </label>\n"
-"        <label>Senha do roteador\n"
-"          <input id='wifi_password' type='password' maxlength='64' placeholder='Opcional'>\n"
-"        </label>\n"
-"      </div>\n"
-"      <div class='row' style='margin-top:12px'>\n"
-"        <button class='primary' onclick='saveWifiConfig()'>Salvar Wi-Fi</button>\n"
-"        <button onclick='refreshState()'>Atualizar</button>\n"
-"      </div>\n"
-"    </section>\n"
-"\n"
-"    <section class='card'>\n"
-"      <h2>Como usar</h2>\n"
-"      <ol>\n"
-"        <li>Abra a página no <code>http://192.168.4.1/</code> ou no IP da sua LAN quando o modo cliente estiver ativo.</li>\n"
-"        <li>Escolha o modo principal: <strong>AP local</strong> ou <strong>Wi-Fi do roteador</strong>.</li>\n"
-"        <li>Se for usar a rede do roteador, informe SSID e senha e clique em <strong>Salvar Wi-Fi</strong>.</li>\n"
-"        <li>Use os botões manuais para testar o motor ou deixe o modo automático ligado.</li>\n"
-"        <li>Para integrações, use os endpoints listados abaixo.</li>\n"
-"      </ol>\n"
-"      <details>\n"
-"        <summary>Integração com Home Assistant</summary>\n"
-"        <p>Exemplo simples com <code>rest_command</code>:</p>\n"
-"        <pre>rest_command:\n"
-"  step_motor_forward:\n"
-"    url: http://192.168.4.1/api/control\n"
-"    method: POST\n"
-"    content_type: application/json\n"
-"    payload: '{\"action\":\"forward\"}'\n"
-"\n"
-"  step_motor_reverse:\n"
-"    url: http://192.168.4.1/api/control\n"
-"    method: POST\n"
-"    content_type: application/json\n"
-"    payload: '{\"action\":\"reverse\"}'\n"
-"\n"
-"  step_motor_stop:\n"
-"    url: http://192.168.4.1/api/control\n"
-"    method: POST\n"
-"    content_type: application/json\n"
-"    payload: '{\"action\":\"stop\"}'\n"
-"\n"
-"  step_motor_auto_start:\n"
-"    url: http://192.168.4.1/api/control\n"
-"    method: POST\n"
-"    content_type: application/json\n"
-"    payload: '{\"action\":\"auto_start\"}'\n"
-"\n"
-"  step_motor_auto_stop:\n"
-"    url: http://192.168.4.1/api/control\n"
-"    method: POST\n"
-"    content_type: application/json\n"
-"    payload: '{\"action\":\"auto_stop\"}'</pre>\n"
-"      </details>\n"
-"      <details>\n"
-"        <summary>Endpoints disponíveis</summary>\n"
-"        <ul>\n"
-"          <li><code>GET /api/health</code></li>\n"
-"          <li><code>GET /api/state</code></li>\n"
-"          <li><code>POST /api/config</code></li>\n"
-"          <li><code>POST /api/control</code></li>\n"
-"          <li><code>GET /api/wifi</code></li>\n"
-"          <li><code>POST /api/wifi</code></li>\n"
-"          <li><code>GET /api/ota</code></li>\n"
-"          <li><code>POST /api/ota</code></li>\n"
-"        </ul>\n"
-"      </details>\n"
-"    </section>\n"
-"\n"
-"    <section class='card'>\n"
-"      <h2>Firmware update (OTA)</h2>\n"
-"      <p class='muted'>Upload a firmware .bin file. The device writes it to the alternate OTA slot, marks it for boot, and reboots automatically. The emergency AP stays available.</p>\n"
-"      <div class='grid'>\n"
-"        <label>Firmware image\n"
-"          <input id='ota_file' type='file' accept='.bin,application/octet-stream' onchange='onOtaFileSelected()'>\n"
-"        </label>\n"
-"      </div>\n"
-"      <div id='ota_file_info' class='muted' style='margin-top:8px'>No firmware image selected.</div>\n"
-"      <div class='row' style='margin-top:12px'>\n"
-"        <button id='ota_upload_btn' class='primary' onclick='uploadOta()'>Upload and reboot</button>\n"
-"        <button id='ota_refresh_btn' onclick='refreshOtaStatus()'>Refresh OTA status</button>\n"
-"      </div>\n"
-"      <div id='ota_status' class='muted' style='margin-top:8px'>Ready.</div>\n"
-"      <progress id='ota_progress' value='0' max='100' style='display:none;'></progress>\n"
-"    </section>\n"
-"\n"
-"    <section class='card'>\n"
-"      <h2>Status</h2>\n"
-"      <div id='status'>Loading...</div>\n"
-"      <pre id='json' class='muted'></pre>\n"
-"    </section>\n"
-"  </main>\n"
-"  <script>\n"
-"    async function api(path, body) {\n"
-"      const opts = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {};\n"
-"      const res = await fetch(path, opts);\n"
-"      if (!res.ok) throw new Error(await res.text());\n"
-"      return res.json();\n"
-"    }\n"
-"\n"
-"    const dirtyFields = new Set();\n"
-"\n"
-"    function markFieldDirty(el) {\n"
-"      if (el && el.id) {\n"
-"        dirtyFields.add(el.id);\n"
-"      }\n"
-"    }\n"
-"\n"
-"    function clearDirtyFields() {\n"
-"      dirtyFields.clear();\n"
-"    }\n"
-"\n"
-"    function syncField(id, value) {\n"
-"      const el = document.getElementById(id);\n"
-"      if (!el) return;\n"
-"      if (dirtyFields.has(id)) return;\n"
-"      if (document.activeElement === el) return;\n"
-"      const next = String(value);\n"
-"      if (el.value !== next) {\n"
-"        el.value = next;\n"
-"      }\n"
-"    }\n"
-"\n"
-"    function motorPrefix(motor) {\n"
-"      return motor === 2 ? 'm2' : 'm1';\n"
-"    }\n"
-"\n"
-"    function applyMotorState(motor, state) {\n"
-"      const prefix = motorPrefix(motor);\n"
-"      syncField(prefix + '_profile', state.profile);\n"
-"      syncField(prefix + '_rpm', state.rpm);\n"
-"      syncField(prefix + '_move_time_ms', state.move_time_ms);\n"
-"      syncField(prefix + '_move_steps', state.move_steps);\n"
-"      syncField(prefix + '_pause_ms', state.pause_ms);\n"
-"      syncField(prefix + '_dir_setup_us', state.dir_setup_us);\n"
-"    }\n"
-"\n"
-"    async function refreshState() {\n"
-"      const state = await api('/api/state');\n"
-"      document.getElementById('json').textContent = JSON.stringify(state, null, 2);\n"
-"      applyMotorState(1, state.motor1);\n"
-"      applyMotorState(2, state.motor2);\n"
-"      syncField('wifi_mode', state.wifi_mode);\n"
-"      syncField('wifi_ssid', state.wifi_ssid);\n"
-"\n"
-"      const wifi = state.wifi_sta_connected ? ('STA ' + state.wifi_sta_ip) : 'STA desconectado';\n"
-"      const ap = state.wifi_ap_started ? ('AP ' + state.wifi_ap_ip) : 'AP off';\n"
-"      document.getElementById('status').innerHTML = `\n"
-"        <span class='pill'>M1 ${state.motor1.running ? 'RUNNING' : 'IDLE'}</span>\n"
-"        <span class='pill'>M1 rpm ${state.motor1.rpm}</span>\n"
-"        <span class='pill'>M1 ${state.motor1.activity}</span>\n"
-"        <span class='pill'>M2 ${state.motor2.running ? 'RUNNING' : 'IDLE'}</span>\n"
-"        <span class='pill'>M2 rpm ${state.motor2.rpm}</span>\n"
-"        <span class='pill'>M2 ${state.motor2.activity}</span>\n"
-"        <span class='pill'>mode ${state.wifi_mode}</span>\n"
-"        <span class='pill'>${wifi}</span>\n"
-"        <span class='pill'>${ap}</span>\n"
-"        <span class='pill'>SSID ${state.wifi_ssid || '—'}</span>\n"
-"        <span class='pill'>emergency AP ${state.wifi_emergency_ap ? 'on' : 'off'}</span>\n"
-"      `;\n"
-"      refreshOtaStatus().catch(console.error);\n"
-"    }\n"
-"\n"
-"    async function refreshOtaStatus() {\n"
-"      const state = await api('/api/ota');\n"
-"      const parts = [];\n"
-"      parts.push(`version ${state.firmware_version}`);\n"
-"      parts.push(`running ${state.running_partition}`);\n"
-"      parts.push(`update ${state.next_partition}`);\n"
-"      parts.push(state.pending_verify ? 'pending verify' : 'confirmed');\n"
-"      parts.push(state.ota_supported ? `slot ${state.slot_size} bytes` : 'OTA disabled');\n"
-"      document.getElementById('ota_status').textContent = parts.join(' • ');\n"
-"    }\n"
-"\n"
-"    function onOtaFileSelected() {\n"
-"      const input = document.getElementById('ota_file');\n"
-"      const info = document.getElementById('ota_file_info');\n"
-"      const file = input.files && input.files[0];\n"
-"      if (!file) {\n"
-"        info.textContent = 'No firmware image selected.';\n"
-"        return;\n"
-"      }\n"
-"      const sizeKb = Math.round(file.size / 1024);\n"
-"      info.textContent = `Selected: ${file.name} (${sizeKb} KB)`;\n"
-"    }\n"
-"\n"
-"    function setOtaControlsDisabled(disabled) {\n"
-"      const ids = ['ota_file', 'ota_upload_btn', 'ota_refresh_btn'];\n"
-"      ids.forEach((id) => {\n"
-"        const el = document.getElementById(id);\n"
-"        if (el) {\n"
-"          el.disabled = disabled;\n"
-"        }\n"
-"      });\n"
-"    }\n"
-"\n"
-"    function waitForOtaReconnect(attempt = 0) {\n"
-"      const status = document.getElementById('ota_status');\n"
-"      if (attempt === 0) {\n"
-"        status.textContent = 'Rebooting the device... waiting for it to come back online.';\n"
-"      }\n"
-"\n"
-"      setTimeout(() => {\n"
-"        refreshState()\n"
-"          .then(() => {\n"
-"            status.textContent = 'Device is back online after OTA reboot.';\n"
-"            setOtaControlsDisabled(false);\n"
-"            const info = document.getElementById('ota_file_info');\n"
-"            if (info) {\n"
-"              info.textContent = 'Firmware upload complete. You can select a new file for the next update.';\n"
-"            }\n"
-"          })\n"
-"          .catch(() => {\n"
-"            if (attempt < 30) {\n"
-"              waitForOtaReconnect(attempt + 1);\n"
-"            } else {\n"
-"              status.textContent = 'Upload finished, but the device did not come back online automatically. Refresh manually in a few seconds.';\n"
-"              setOtaControlsDisabled(false);\n"
-"            }\n"
-"          });\n"
-"      }, attempt === 0 ? 1500 : 2000);\n"
-"    }\n"
-"\n"
-"    async function uploadOta() {\n"
-"      const input = document.getElementById('ota_file');\n"
-"      const file = input.files && input.files[0];\n"
-"      const status = document.getElementById('ota_status');\n"
-"      const progress = document.getElementById('ota_progress');\n"
-"      if (!file) {\n"
-"        status.textContent = 'Select a .bin firmware image first.';\n"
-"        return;\n"
-"      }\n"
-"\n"
-"      setOtaControlsDisabled(true);\n"
-"      progress.style.display = 'block';\n"
-"      progress.value = 0;\n"
-"      status.textContent = 'Uploading firmware...';\n"
-"\n"
-"      await new Promise((resolve, reject) => {\n"
-"        const xhr = new XMLHttpRequest();\n"
-"        xhr.open('POST', '/api/ota');\n"
-"        xhr.responseType = 'json';\n"
-"        xhr.setRequestHeader('Content-Type', 'application/octet-stream');\n"
-"        xhr.upload.onprogress = (event) => {\n"
-"          if (event.lengthComputable) {\n"
-"            progress.value = Math.round((event.loaded / event.total) * 100);\n"
-"            status.textContent = `Uploading firmware... ${progress.value}%`;\n"
-"          }\n"
-"        };\n"
-"        xhr.onload = () => {\n"
-"          progress.style.display = 'none';\n"
-"          if (xhr.status >= 200 && xhr.status < 300) {\n"
-"            const rebootMs = (xhr.response && xhr.response.rebooting_in_ms) || 1500;\n"
-"            status.textContent = `Upload complete. Rebooting in ${Math.round(rebootMs / 100) / 10}s...`;\n"
-"            input.value = '';\n"
-"            const info = document.getElementById('ota_file_info');\n"
-"            if (info) {\n"
-"              info.textContent = 'Firmware uploaded successfully. Waiting for reboot...';\n"
-"            }\n"
-"            waitForOtaReconnect();\n"
-"            resolve();\n"
-"          } else {\n"
-"            setOtaControlsDisabled(false);\n"
-"            const message = (xhr.response && xhr.response.message) || xhr.responseText || `HTTP ${xhr.status}`;\n"
-"            status.textContent = `OTA failed: ${message}`;\n"
-"            reject(new Error(message));\n"
-"          }\n"
-"        };\n"
-"        xhr.onerror = () => {\n"
-"          progress.style.display = 'none';\n"
-"          setOtaControlsDisabled(false);\n"
-"          status.textContent = 'OTA upload failed due to a network error.';\n"
-"          reject(new Error('network error'));\n"
-"        };\n"
-"        xhr.send(file);\n"
-"      });\n"
-"    }\n"
-"\n"
-"    async function saveMotionConfig(motor) {\n"
-"      const prefix = motorPrefix(motor);\n"
-"      await api('/api/config', {\n"
-"        motor,\n"
-"        profile: document.getElementById(prefix + '_profile').value,\n"
-"        rpm: parseInt(document.getElementById(prefix + '_rpm').value, 10),\n"
-"        move_time_ms: parseInt(document.getElementById(prefix + '_move_time_ms').value, 10),\n"
-"        move_steps: parseInt(document.getElementById(prefix + '_move_steps').value, 10),\n"
-"        pause_ms: parseInt(document.getElementById(prefix + '_pause_ms').value, 10),\n"
-"        dir_setup_us: parseInt(document.getElementById(prefix + '_dir_setup_us').value, 10)\n"
-"      });\n"
-"      clearDirtyFields();\n"
-"      await refreshState();\n"
-"    }\n"
-"\n"
-"    async function saveWifiConfig() {\n"
-"      await api('/api/wifi', {\n"
-"        mode: document.getElementById('wifi_mode').value,\n"
-"        ssid: document.getElementById('wifi_ssid').value,\n"
-"        password: document.getElementById('wifi_password').value\n"
-"      });\n"
-"      document.getElementById('wifi_password').value = '';\n"
-"      clearDirtyFields();\n"
-"      await refreshState();\n"
-"    }\n"
-"\n"
-"    async function sendAction(motor, action) {\n"
-"      await api('/api/control', { motor, action });\n"
-"      await refreshState();\n"
-"    }\n"
-"\n"
-"    document.querySelectorAll('input, select').forEach((el) => {\n"
-"      el.addEventListener('input', () => markFieldDirty(el));\n"
-"      el.addEventListener('change', () => markFieldDirty(el));\n"
-"    });\n"
-"\n"
-"    refreshState().catch(console.error);\n"
-"    setInterval(() => refreshState().catch(console.error), 1000);\n"
-"  </script>\n"
-"</body>\n"
-"</html>\n"
-;
-
 static const char *motion_profile_to_string(motion_profile_t profile)
 {
     return (profile == MOTION_PROFILE_STEPS) ? "steps" : "time";
@@ -649,6 +214,10 @@ static const char *motor_action_to_string(motor_action_t action)
             return "forward";
         case MOTOR_ACTION_JOG_REVERSE:
             return "reverse";
+        case MOTOR_ACTION_HOLD_FORWARD:
+            return "hold_forward";
+        case MOTOR_ACTION_HOLD_REVERSE:
+            return "hold_reverse";
         case MOTOR_ACTION_START_AUTO:
             return "auto_start";
         case MOTOR_ACTION_STOP:
@@ -666,6 +235,8 @@ static const char *motor_activity_to_string(motor_activity_t activity)
             return "running";
         case MOTOR_ACTIVITY_AUTO:
             return "auto";
+        case MOTOR_ACTIVITY_HOLD:
+            return "hold";
         case MOTOR_ACTIVITY_IDLE:
         default:
             return "idle";
@@ -1014,6 +585,7 @@ static void state_init_defaults(void)
         g_motors[i].state.pause_ms = PAUSE_MS;
         g_motors[i].state.dir_setup_us = DIR_SETUP_US;
         g_motors[i].state.auto_mode = false;
+        g_motors[i].state.hold_mode = false;
         g_motors[i].state.running = false;
         g_motors[i].state.activity = MOTOR_ACTIVITY_IDLE;
         g_motors[i].state.pending_action = MOTOR_ACTION_NONE;
@@ -1224,6 +796,7 @@ static void set_activity_idle(motor_state_t *state)
     state->activity = MOTOR_ACTIVITY_IDLE;
     state->running = false;
     state->auto_mode = false;
+    state->hold_mode = false;
 }
 
 static void set_activity_running(motor_state_t *state)
@@ -1231,6 +804,7 @@ static void set_activity_running(motor_state_t *state)
     state->activity = MOTOR_ACTIVITY_RUNNING;
     state->running = true;
     state->auto_mode = false;
+    state->hold_mode = false;
 }
 
 static void set_activity_auto(motor_state_t *state)
@@ -1238,7 +812,17 @@ static void set_activity_auto(motor_state_t *state)
     state->activity = MOTOR_ACTIVITY_AUTO;
     state->running = true;
     state->auto_mode = true;
+    state->hold_mode = false;
 }
+
+static void set_activity_hold(motor_state_t *state)
+{
+    state->activity = MOTOR_ACTIVITY_HOLD;
+    state->running = true;
+    state->auto_mode = false;
+    state->hold_mode = true;
+}
+
 
 static void motor_task(void *arg)
 {
@@ -1275,6 +859,33 @@ static void motor_task(void *arg)
 
             const uint64_t duration_us = motion_duration_us_from_state(&snapshot);
             (void)motor_run_segment(motor_index, action == MOTOR_ACTION_JOG_FORWARD, duration_us, snapshot.dir_setup_us);
+
+            motor_stop_output(motor_index);
+            xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+            set_activity_idle(&g_motors[motor_index].state);
+            xSemaphoreGive(g_state_mutex);
+            continue;
+        }
+
+        if (action == MOTOR_ACTION_HOLD_FORWARD || action == MOTOR_ACTION_HOLD_REVERSE) {
+            const bool forward = (action == MOTOR_ACTION_HOLD_FORWARD);
+
+            while (true) {
+                motor_state_t snapshot = motor_snapshot(motor_index);
+                if (!snapshot.hold_mode) {
+                    break;
+                }
+
+                motor_apply_pwm_period(motor_index, snapshot.step_period_us);
+
+                xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+                set_activity_hold(&g_motors[motor_index].state);
+                xSemaphoreGive(g_state_mutex);
+
+                if (!motor_run_segment(motor_index, forward, HOLD_CHUNK_US, snapshot.dir_setup_us)) {
+                    break;
+                }
+            }
 
             motor_stop_output(motor_index);
             xSemaphoreTake(g_state_mutex, portMAX_DELAY);
@@ -1451,6 +1062,7 @@ static void build_motor_json(char *buf, size_t len, size_t motor_index)
              "\"id\":%u,"
              "\"profile\":\"%s\","
              "\"auto_mode\":%s,"
+             "\"hold_mode\":%s,"
              "\"running\":%s,"
              "\"activity\":\"%s\","
              "\"pending_action\":\"%s\","
@@ -1468,6 +1080,7 @@ static void build_motor_json(char *buf, size_t len, size_t motor_index)
              (unsigned)(motor_index + 1U),
              motion_profile_to_string(s.profile),
              bool_to_json(s.auto_mode),
+             bool_to_json(s.hold_mode),
              bool_to_json(s.running),
              motor_activity_to_string(s.activity),
              motor_action_to_string(s.pending_action),
@@ -1655,11 +1268,18 @@ static esp_err_t control_post_handler(httpd_req_t *req)
 
     motor_action_t pending = MOTOR_ACTION_NONE;
     bool auto_mode = false;
+    bool hold_mode = false;
 
     if (strcmp(action, "forward") == 0) {
         pending = MOTOR_ACTION_JOG_FORWARD;
     } else if (strcmp(action, "reverse") == 0) {
         pending = MOTOR_ACTION_JOG_REVERSE;
+    } else if (strcmp(action, "hold_forward") == 0) {
+        pending = MOTOR_ACTION_HOLD_FORWARD;
+        hold_mode = true;
+    } else if (strcmp(action, "hold_reverse") == 0) {
+        pending = MOTOR_ACTION_HOLD_REVERSE;
+        hold_mode = true;
     } else if (strcmp(action, "stop") == 0) {
         pending = MOTOR_ACTION_STOP;
     } else if (strcmp(action, "auto_start") == 0) {
@@ -1675,8 +1295,12 @@ static esp_err_t control_post_handler(httpd_req_t *req)
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
     g_motors[motor_index].state.pending_action = pending;
     g_motors[motor_index].state.auto_mode = auto_mode;
+    if (hold_mode) {
+        g_motors[motor_index].state.hold_mode = true;
+    }
     if (pending == MOTOR_ACTION_STOP) {
         g_motors[motor_index].state.auto_mode = false;
+        g_motors[motor_index].state.hold_mode = false;
     }
     xSemaphoreGive(g_state_mutex);
 
