@@ -4,6 +4,12 @@ ESP-IDF firmware for **two independent TMC2208 stepper drivers** running on a **
 
 ![Dual motor wiring diagram](assets/dual-motor-wiring.svg)
 
+## Real hardware setup
+
+| Prototype view 1 | Prototype view 2 |
+|---|---|
+| ![Motor setup photo 1](assets/motor-setup-1.jpg) | ![Motor setup photo 2](assets/motor-setup-2.jpg) |
+
 The project provides:
 
 - hardware-generated STEP signal using PWM/LEDC
