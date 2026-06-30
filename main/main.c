@@ -86,6 +86,34 @@
 #define DIR_SETUP_US 20U
 #endif
 
+#ifndef SERVO_PWM_GPIO
+#define SERVO_PWM_GPIO GPIO_NUM_3
+#endif
+
+#ifndef SERVO_PWM_HZ
+#define SERVO_PWM_HZ 50U
+#endif
+
+#ifndef SERVO_MIN_ANGLE
+#define SERVO_MIN_ANGLE 0U
+#endif
+
+#ifndef SERVO_MAX_ANGLE
+#define SERVO_MAX_ANGLE 180U
+#endif
+
+#ifndef SERVO_DEFAULT_ANGLE
+#define SERVO_DEFAULT_ANGLE 90U
+#endif
+
+#ifndef SERVO_MIN_PULSE_US
+#define SERVO_MIN_PULSE_US 500U
+#endif
+
+#ifndef SERVO_MAX_PULSE_US
+#define SERVO_MAX_PULSE_US 2500U
+#endif
+
 #ifndef CONFIG_STEP_MOTOR_DEVICE_NAME
 #define CONFIG_STEP_MOTOR_DEVICE_NAME "esp32-step-motor"
 #endif
@@ -174,6 +202,21 @@ typedef struct {
     char hostname[32];
 } app_state_t;
 
+typedef struct {
+    gpio_num_t pwm_gpio;
+    ledc_channel_t channel;
+    ledc_timer_t timer;
+} servo_hw_t;
+
+typedef struct {
+    servo_hw_t hw;
+    uint32_t angle;
+    uint32_t target_angle;
+    uint32_t current_pulse_us;
+    uint32_t pwm_resolution_bits;
+    bool enabled;
+} servo_ctx_t;
+
 static SemaphoreHandle_t g_state_mutex;
 static httpd_handle_t g_http_server;
 static esp_netif_t *g_sta_netif;
@@ -181,9 +224,11 @@ static esp_netif_t *g_ap_netif;
 static esp_event_handler_instance_t g_wifi_handler_instance;
 static esp_event_handler_instance_t g_ip_handler_instance;
 static motor_ctx_t g_motors[2];
+static servo_ctx_t g_servo;
 static uint32_t step_frequency_hz_from_period(uint32_t step_period_us);
 static uint32_t rpm_from_step_period_us(uint32_t step_period_us);
 static uint32_t step_period_us_from_rpm(uint32_t rpm);
+static uint32_t servo_angle_to_pulse_us(uint32_t angle);
 
 typedef enum {
     WIFI_PREF_AP = 0,
@@ -592,6 +637,15 @@ static void state_init_defaults(void)
         g_motors[i].state.current_step_period_us = 0U;
         g_motors[i].state.pwm_resolution_bits = 0U;
     }
+
+    g_servo.hw.pwm_gpio = SERVO_PWM_GPIO;
+    g_servo.hw.channel = LEDC_CHANNEL_2;
+    g_servo.hw.timer = LEDC_TIMER_2;
+    g_servo.angle = SERVO_DEFAULT_ANGLE;
+    g_servo.target_angle = SERVO_DEFAULT_ANGLE;
+    g_servo.current_pulse_us = servo_angle_to_pulse_us(SERVO_DEFAULT_ANGLE);
+    g_servo.pwm_resolution_bits = 0U;
+    g_servo.enabled = false;
 }
 
 static app_state_t state_snapshot(void)
@@ -709,6 +763,54 @@ static void motor_apply_pwm_period(size_t motor_index, uint32_t step_period_us)
 
     ctx->state.current_step_period_us = step_period_us;
     ctx->state.pwm_resolution_bits = resolution_bits;
+}
+
+static uint32_t servo_angle_to_pulse_us(uint32_t angle)
+{
+    angle = clamp_u32(angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+    const uint32_t angle_span = SERVO_MAX_ANGLE - SERVO_MIN_ANGLE;
+    if (angle_span == 0U) {
+        return SERVO_MIN_PULSE_US;
+    }
+
+    const uint32_t pulse_span = SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US;
+    return SERVO_MIN_PULSE_US + (uint32_t)(((uint64_t)(angle - SERVO_MIN_ANGLE) * pulse_span) / angle_span);
+}
+
+static uint32_t servo_resolution_bits_for_frequency(uint32_t freq_hz)
+{
+    (void)freq_hz;
+    return LEDC_TIMER_14_BIT;
+}
+
+static void servo_apply_pwm_frequency(void)
+{
+    const uint32_t freq_hz = SERVO_PWM_HZ;
+    const uint32_t resolution_bits = servo_resolution_bits_for_frequency(freq_hz);
+
+    ledc_timer_config_t timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = (ledc_timer_bit_t)resolution_bits,
+        .timer_num = g_servo.hw.timer,
+        .freq_hz = freq_hz,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer));
+
+    g_servo.pwm_resolution_bits = resolution_bits;
+}
+
+static void servo_apply_angle(uint32_t angle)
+{
+    g_servo.target_angle = clamp_u32(angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+    g_servo.angle = g_servo.target_angle;
+    g_servo.current_pulse_us = servo_angle_to_pulse_us(g_servo.angle);
+
+    const uint32_t max_duty = (1U << g_servo.pwm_resolution_bits) - 1U;
+    const uint32_t duty = (uint32_t)(((uint64_t)g_servo.current_pulse_us * max_duty) / 20000ULL);
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, g_servo.hw.channel, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, g_servo.hw.channel));
+    g_servo.enabled = true;
 }
 
 static void motor_step_output_start(size_t motor_index)
@@ -1097,6 +1199,29 @@ static void build_motor_json(char *buf, size_t len, size_t motor_index)
              s.dir_setup_us);
 }
 
+static void build_servo_json(char *buf, size_t len)
+{
+    snprintf(buf, len,
+             "{"
+             "\"gpio\":%d,"
+             "\"enabled\":%s,"
+             "\"angle\":%" PRIu32 ","
+             "\"target_angle\":%" PRIu32 ","
+             "\"min_angle\":%u,"
+             "\"max_angle\":%u,"
+             "\"pulse_min_us\":%u,"
+             "\"pulse_max_us\":%u"
+             "}",
+             g_servo.hw.pwm_gpio,
+             bool_to_json(g_servo.enabled),
+             g_servo.angle,
+             g_servo.target_angle,
+             SERVO_MIN_ANGLE,
+             SERVO_MAX_ANGLE,
+             SERVO_MIN_PULSE_US,
+             SERVO_MAX_PULSE_US);
+}
+
 static void build_state_json(char *buf, size_t len)
 {
     const app_state_t s = state_snapshot();
@@ -1108,13 +1233,16 @@ static void build_state_json(char *buf, size_t len)
     const char *running_partition_label = partition_label_or_unknown(running_partition);
     char motor1[512];
     char motor2[512];
+    char servo[256];
     build_motor_json(motor1, sizeof(motor1), 0U);
     build_motor_json(motor2, sizeof(motor2), 1U);
+    build_servo_json(servo, sizeof(servo));
 
     snprintf(buf, len,
              "{"
              "\"motor1\":%s,"
              "\"motor2\":%s,"
+             "\"servo\":%s,"
              "\"wifi_sta_connected\":%s,"
              "\"wifi_sta_ip\":\"%s\","
              "\"wifi_ap_started\":%s,"
@@ -1129,6 +1257,7 @@ static void build_state_json(char *buf, size_t len)
              "}",
              motor1,
              motor2,
+             servo,
              bool_to_json(s.wifi_sta_connected),
              s.wifi_sta_ip,
              bool_to_json(s.wifi_ap_started),
@@ -1181,7 +1310,7 @@ static esp_err_t health_get_handler(httpd_req_t *req)
 
 static esp_err_t state_get_handler(httpd_req_t *req)
 {
-    char json[1024];
+    char json[2048];
     build_state_json(json, sizeof(json));
     return send_json(req, json);
 }
@@ -1244,7 +1373,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     free(body);
     notify_motor_task(motor_index);
 
-    char json[1024];
+    char json[2048];
     build_state_json(json, sizeof(json));
     return send_json(req, json);
 }
@@ -1307,7 +1436,47 @@ static esp_err_t control_post_handler(httpd_req_t *req)
     free(body);
     notify_motor_task(motor_index);
 
-    char json[1024];
+    char json[2048];
+    build_state_json(json, sizeof(json));
+    return send_json(req, json);
+}
+
+static esp_err_t servo_get_handler(httpd_req_t *req)
+{
+    char json[256];
+    build_servo_json(json, sizeof(json));
+    return send_json(req, json);
+}
+
+static esp_err_t servo_post_handler(httpd_req_t *req)
+{
+    char *body = read_request_body(req);
+    if (body == NULL) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid request body");
+    }
+
+    uint32_t angle = SERVO_DEFAULT_ANGLE;
+    char action[32];
+    if (json_get_string_field(body, "action", action, sizeof(action))) {
+        if (strcmp(action, "center") == 0) {
+            angle = 90U;
+        } else if (strcmp(action, "min") == 0) {
+            angle = SERVO_MIN_ANGLE;
+        } else if (strcmp(action, "max") == 0) {
+            angle = SERVO_MAX_ANGLE;
+        }
+    }
+    (void)json_get_uint32_field(body, "angle", &angle);
+
+    angle = clamp_u32(angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+
+    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    servo_apply_angle(angle);
+    xSemaphoreGive(g_state_mutex);
+
+    free(body);
+
+    char json[2048];
     build_state_json(json, sizeof(json));
     return send_json(req, json);
 }
@@ -1405,6 +1574,9 @@ static void start_http_server(void)
     register_uri(g_http_server, "/api/config", HTTP_OPTIONS, options_handler);
     register_uri(g_http_server, "/api/control", HTTP_POST, control_post_handler);
     register_uri(g_http_server, "/api/control", HTTP_OPTIONS, options_handler);
+    register_uri(g_http_server, "/api/servo", HTTP_GET, servo_get_handler);
+    register_uri(g_http_server, "/api/servo", HTTP_OPTIONS, options_handler);
+    register_uri(g_http_server, "/api/servo", HTTP_POST, servo_post_handler);
     register_uri(g_http_server, "/api/wifi", HTTP_GET, wifi_get_handler);
     register_uri(g_http_server, "/api/wifi", HTTP_OPTIONS, options_handler);
     register_uri(g_http_server, "/api/wifi", HTTP_POST, wifi_post_handler);
@@ -1512,7 +1684,8 @@ static void motor_setup(void)
 
     gpio_config_t io = {
         .pin_bit_mask = (1ULL << g_motors[0].hw.step_gpio) | (1ULL << g_motors[0].hw.dir_gpio) | (1ULL << g_motors[0].hw.en_gpio) |
-                        (1ULL << g_motors[1].hw.step_gpio) | (1ULL << g_motors[1].hw.dir_gpio) | (1ULL << g_motors[1].hw.en_gpio),
+                        (1ULL << g_motors[1].hw.step_gpio) | (1ULL << g_motors[1].hw.dir_gpio) | (1ULL << g_motors[1].hw.en_gpio) |
+                        (1ULL << g_servo.hw.pwm_gpio),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -1548,6 +1721,19 @@ static void motor_setup(void)
     };
     ESP_ERROR_CHECK(ledc_channel_config(&channel_2));
 
+    servo_apply_pwm_frequency();
+    ledc_channel_config_t servo_channel = {
+        .gpio_num = g_servo.hw.pwm_gpio,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = g_servo.hw.channel,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = g_servo.hw.timer,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&servo_channel));
+    servo_apply_angle(SERVO_DEFAULT_ANGLE);
+
     for (size_t i = 0; i < 2; ++i) {
         motor_apply_pwm_period(i, g_motors[i].state.step_period_us);
         motor_stop_output(i);
@@ -1555,6 +1741,7 @@ static void motor_setup(void)
 
     ESP_LOGI(TAG, "Motor 1 pins STEP=%d DIR=%d EN=%d", MOTOR1_STEP_GPIO, MOTOR1_DIR_GPIO, MOTOR1_EN_GPIO);
     ESP_LOGI(TAG, "Motor 2 pins STEP=%d DIR=%d EN=%d", MOTOR2_STEP_GPIO, MOTOR2_DIR_GPIO, MOTOR2_EN_GPIO);
+    ESP_LOGI(TAG, "Servo pin PWM=%d angle=%" PRIu32 "..%" PRIu32 " default=%" PRIu32, SERVO_PWM_GPIO, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE, SERVO_DEFAULT_ANGLE);
     ESP_LOGI(TAG, "Enable pin is %s", EN_ACTIVE_LOW ? "active-low" : "active-high");
     ESP_LOGI(TAG, "Defaults: motor1 profile=%s rpm=%" PRIu32 " step_period=%" PRIu32 " us move_time=%" PRIu32 " ms move_steps=%" PRIu32 " pause=%" PRIu32 " ms",
              motion_profile_to_string(g_motors[0].state.profile), g_motors[0].state.rpm, g_motors[0].state.step_period_us, g_motors[0].state.move_time_ms,
@@ -1589,5 +1776,5 @@ void app_main(void)
     motor_enable(1, true);
 
     ESP_LOGI(TAG, "HTTP server ready: http://%s/", HOSTNAME);
-    ESP_LOGI(TAG, "API endpoints: GET /api/health, GET /api/state, POST /api/config, POST /api/control, GET /api/wifi, POST /api/wifi, GET /api/ota, POST /api/ota");
+    ESP_LOGI(TAG, "API endpoints: GET /api/health, GET /api/state, POST /api/config, POST /api/control, GET /api/servo, POST /api/servo, GET /api/wifi, POST /api/wifi, GET /api/ota, POST /api/ota");
 }

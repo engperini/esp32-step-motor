@@ -20,6 +20,7 @@ The project provides:
 - automatic back-and-forth motion for each motor
 - motion profiles based on **time** or **steps**
 - independent configuration and commands per motor
+- servo position control with configurable 0° to 180° moves
 - Wi-Fi configuration from the web UI
 - an **emergency AP** for recovery and local access
 
@@ -29,10 +30,15 @@ The project provides:
 
 The default pins are defined in `main/main.c`:
 
-| Motor | STEP | DIR | EN |
-|---|---:|---:|---:|
-| Motor 1 | GPIO4 | GPIO5 | GPIO6 |
-| Motor 2 | GPIO7 | GPIO8 | GPIO9 |
+| Actuator | Signal | GPIO / mode |
+|---|---|---|
+| Motor 1 | STEP | GPIO4 |
+| Motor 1 | DIR | GPIO5 |
+| Motor 1 | EN | GPIO6 |
+| Motor 2 | STEP | GPIO7 |
+| Motor 2 | DIR | GPIO8 |
+| Motor 2 | EN | GPIO9 |
+| Servo | PWM | GPIO3 @ 50Hz |
 
 The TMC2208 enable pin is **active-low** by default.
 
@@ -113,8 +119,8 @@ The web page lets you:
 
 ### Manual control
 
-- `Jog forward` / `Jog reverse` / `Stop` for each motor
-- `Start auto` / `Stop auto` for each motor
+- `Jog forward` / `Jog reverse` / `Stop` / `Start auto` / `Stop auto` for each motor
+- servo section with direct angle control from 0° to 180°
 
 ### Live status
 
@@ -140,6 +146,8 @@ Available endpoints:
 - `GET /api/state`
 - `POST /api/config`
 - `POST /api/control`
+- `GET /api/servo`
+- `POST /api/servo`
 - `GET /api/wifi`
 - `POST /api/wifi`
 
